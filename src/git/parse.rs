@@ -228,10 +228,12 @@ pub fn log(data: &[u8]) -> Vec<CommitMeta> {
 /// Parse `git log --format=%H%x00%at --name-only -z --no-renames`.
 ///
 /// The stream is flat and NUL-separated, but the record boundary is a newline
-/// rather than a NUL: git emits `<oid>NUL<time>\n<path>NUL<path>NUL<oid>NUL...`,
-/// so the timestamp and the commit's *first* path arrive in one field. A commit
-/// that touched nothing (an empty commit, or a merge) has no trailing newline
-/// on its time field at all.
+/// rather than a NUL: git emits `<oid>NUL<time>NUL\n<path>NUL<path>NUL...`, so
+/// the newline that `--name-only` puts between the header and the file list
+/// arrives attached to the *front* of the commit's first path. Left in place it
+/// would make `\nsrc/a.rs` a different key from `src/a.rs`, so the same file
+/// would appear twice with its commits split between the two. A commit that
+/// touched nothing (an empty commit, or a merge) emits no path field at all.
 ///
 /// Returns, per path, the time it was last touched and how many commits in the
 /// walk touched it — the age and churn inputs the heatmap needs.
@@ -247,6 +249,9 @@ pub fn history_walk(data: &[u8]) -> Vec<(PathBuf, i64, u32)> {
         // commit's first path glued on after a newline when it has one.
         if looks_like_oid(f) {
             let Some(tf) = fields.next() else { break };
+            // Older git glues the first path onto the time field after a
+            // newline; newer git emits it as its own field with the newline
+            // leading. Handle both rather than depending on the version.
             let (t, first) = match tf.iter().position(|&b| b == b'\n') {
                 Some(i) => (&tf[..i], Some(&tf[i + 1..])),
                 None => (tf, None),
@@ -262,10 +267,21 @@ pub fn history_walk(data: &[u8]) -> Vec<(PathBuf, i64, u32)> {
             }
             continue;
         }
-        touch(&mut acc, f, time);
+        touch(&mut acc, strip_leading_newline(f), time);
     }
 
     acc.into_iter().map(|(p, (t, n))| (p, t, n)).collect()
+}
+
+/// Drop the newline `--name-only` puts before a commit's first path.
+///
+/// A path cannot begin with a newline in any real tree, so this is unambiguous;
+/// leaving it on would split one file across two keys.
+fn strip_leading_newline(f: &[u8]) -> &[u8] {
+    match f.first() {
+        Some(b'\n') => &f[1..],
+        _ => f,
+    }
 }
 
 /// Record that `path` was touched at `time`, keeping the newest timestamp.
@@ -412,6 +428,28 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x001000\nsrc/a.rs\x00docs/c.md\x00";
         assert_eq!(get("src/b.rs").1, 2000);
         assert_eq!(get("src/b.rs").2, 1);
         assert_eq!(get("docs/c.md").1, 1000);
+    }
+
+    #[test]
+    fn history_walk_handles_the_newline_leading_the_first_path() {
+        // Regression: git emits `<oid>NUL<time>NUL\n<first path>NUL...`, so the
+        // newline leads the first path rather than sitting inside the time
+        // field. Left attached it made "\nsrc/a.rs" a separate key, so the file
+        // showed up twice with its commit count split between the two rows.
+        let data = b"\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x002000\x00\nsrc/a.rs\x00src/b.rs\x00\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x001000\x00\nsrc/a.rs\x00";
+        let w = history_walk(data);
+
+        assert_eq!(w.len(), 2, "a leading newline must not fork a path: {w:?}");
+        let get = |p: &str| w.iter().find(|e| e.0 == PathBuf::from(p)).unwrap();
+        assert_eq!(get("src/a.rs").2, 2, "both commits must land on one key");
+        assert_eq!(get("src/a.rs").1, 2000);
+        assert_eq!(get("src/b.rs").2, 1);
+        assert!(
+            !w.iter().any(|e| e.0.to_string_lossy().starts_with('\n')),
+            "no path may keep its leading newline: {w:?}"
+        );
     }
 
     #[test]
