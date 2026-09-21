@@ -272,6 +272,94 @@ fn tiny_terminal_does_not_panic() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn log_view_loads_commits_and_highlights_their_files() {
+    let dir = fixture("log");
+    // A second commit touching one file, so the map highlight is checkable.
+    std::fs::write(dir.join("src/untouched.rs"), "// changed now\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "second commit"]);
+
+    let backend = PorcelainBackend::discover(&dir).unwrap();
+    let log = backend.log(10).unwrap();
+    assert_eq!(log[0].subject, "second commit");
+    assert!(log.len() >= 2, "expected at least two commits");
+
+    // The newest commit touched exactly the file we just changed.
+    let paths = backend.paths_in_commit(&log[0].oid).unwrap();
+    assert!(
+        paths.contains(&PathBuf::from("src/untouched.rs")),
+        "paths_in_commit missed the changed file: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&PathBuf::from("src/lib.rs")),
+        "paths_in_commit reported an untouched file"
+    );
+
+    // And its diff is non-empty.
+    let d = backend.commit_diff(&log[0].oid).unwrap();
+    assert!(!d.hunks.is_empty(), "commit diff had no hunks");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn log_view_renders_a_timeline_and_a_commit_list() {
+    let dir = fixture("logview");
+    git(&dir, &["commit", "-qm", "another commit", "--allow-empty"]);
+
+    let backend = Arc::new(PorcelainBackend::discover(&dir).unwrap());
+    let (req_tx, req_rx) = mpsc::channel::<Request>();
+    let (msg_tx, msg_rx) = mpsc::channel::<Message>();
+    let handle = worker::spawn(backend, req_rx, msg_tx);
+
+    req_tx.send(Request::Tree).unwrap();
+    req_tx.send(Request::Status).unwrap();
+    let mut app = App::new(req_tx.clone());
+    for _ in 0..2 {
+        app.apply(msg_rx.recv().unwrap());
+    }
+
+    app.view = gitmap::app::View::Log;
+    req_tx.send(Request::Log { limit: 20 }).unwrap();
+    app.apply(msg_rx.recv().unwrap()); // Log
+    app.apply(msg_rx.recv().unwrap()); // CommitDetail
+
+    let mut term = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<Vec<_>>()
+        .join("");
+
+    assert!(!app.log.is_empty(), "log did not load");
+    assert!(text.contains("another commit"), "commit subject missing");
+    // The tab bar replaced the block title, so every view is named, with the
+    // active one highlighted.
+    for label in ["changes", "age", "history"] {
+        assert!(text.contains(label), "tab {label:?} missing from the bar");
+    }
+    // The braille strip is drawn.
+    assert!(
+        text.chars()
+            .any(|c| (0x2800..=0x28ff).contains(&(c as u32))),
+        "no braille timeline in the pane"
+    );
+    assert!(
+        !app.commit_paths.is_empty(),
+        "the selected commit highlighted no files"
+    );
+
+    req_tx.send(Request::Quit).unwrap();
+    drop(req_tx);
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Not an assertion — prints the map as a letter grid, one letter per file, so
 /// a human can check the treemap's shape. Colour is not used here because
 /// neighbouring files with the same status share a colour and would merge.

@@ -282,6 +282,24 @@ pub const MAGMA: [Rgb; 8] = [
     Rgb(254, 194, 135),
 ];
 
+/// GitHub's contribution-graph greens, dark to light.
+///
+/// Four steps plus an "empty" at the bottom, matching how the contribution
+/// graph reads: absence is a flat near-background tile, and any activity at all
+/// is unmistakably green.
+pub const CONTRIB_GREEN: [Rgb; 5] = [
+    Rgb(38, 42, 48),  // no commits — barely above the background
+    Rgb(14, 68, 41),  // light activity
+    Rgb(0, 109, 50),  //
+    Rgb(38, 166, 65), //
+    Rgb(57, 211, 83), // busiest
+];
+
+/// Pick a contribution-graph green for a level in `0..=4`.
+pub fn contrib_green(level: u8) -> Rgb {
+    CONTRIB_GREEN[(level as usize).min(CONTRIB_GREEN.len() - 1)]
+}
+
 /// Status colours.
 ///
 /// Deliberately not red/green as the only distinction between modified and
@@ -621,6 +639,40 @@ mod tests {
         // would put stray colour on the map.
         let grey = Rgb(50, 50, 50);
         assert_eq!(shift_hue(grey, 40.0), grey);
+    }
+
+    #[test]
+    fn contrib_green_ramp_brightens_monotonically() {
+        // Level 0 is "no activity" and must be dim; every step up must be
+        // visibly lighter, the way a contribution graph reads.
+        let l: Vec<f32> = (0..5).map(|i| to_oklab(contrib_green(i)).l).collect();
+        for w in l.windows(2) {
+            assert!(w[1] > w[0], "ramp is not monotonic: {l:?}");
+        }
+        assert!(l[0] < 0.35, "the empty step should be dark");
+        assert!(l[4] > 0.65, "the busiest step should be bright");
+    }
+
+    #[test]
+    fn contrib_green_is_actually_green() {
+        // Levels 1..=4 should read as green, not merely as "brighter grey".
+        for i in 1..5u8 {
+            let o = to_oklab(contrib_green(i));
+            let hue = o.b.atan2(o.a).to_degrees().rem_euclid(360.0);
+            assert!(
+                (120.0..=165.0).contains(&hue),
+                "level {i} has hue {hue}, which is not green"
+            );
+            assert!(
+                (o.a * o.a + o.b * o.b).sqrt() > 0.04,
+                "level {i} is washed out"
+            );
+        }
+    }
+
+    #[test]
+    fn contrib_green_clamps_out_of_range() {
+        assert_eq!(contrib_green(9), contrib_green(4));
     }
 
     #[test]

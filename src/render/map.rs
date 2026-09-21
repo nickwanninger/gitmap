@@ -18,6 +18,10 @@ pub struct MapData {
     pub status: HashMap<PathBuf, FileStatus>,
     /// Seconds since the file's last modifying commit, when known.
     pub age: HashMap<PathBuf, i64>,
+    /// Commits touching each file within the history walk.
+    pub churn: HashMap<PathBuf, u32>,
+    /// Files touched by the commit selected in the log view.
+    pub commit_paths: std::collections::HashSet<PathBuf>,
 }
 
 impl Default for MapData {
@@ -31,6 +35,8 @@ impl MapData {
         MapData {
             status: HashMap::new(),
             age: HashMap::new(),
+            churn: HashMap::new(),
+            commit_paths: std::collections::HashSet::new(),
         }
     }
 }
@@ -147,7 +153,11 @@ impl Colorizer for HeatColorizer {
     fn color(&self, tree: &Tree, id: NodeId, data: &MapData) -> Rgb {
         match data.age.get(&tree.node(id).path) {
             Some(&age) => palette::sample(&palette::MAGMA, Self::t(age)),
-            None => self.palette.unchanged,
+            // No history at all: the file is untracked, or older than the
+            // walk's depth. Rendered as a cold neutral rather than borrowing
+            // the ramp's dark end, which would read as "ancient" — a claim the
+            // data does not support.
+            None => palette::from_lch(250.0, 0.015, 0.22),
         }
     }
 
@@ -162,6 +172,43 @@ impl Colorizer for HeatColorizer {
 
     fn name(&self) -> &'static str {
         "heatmap"
+    }
+}
+
+/// Colour by whether the selected commit touched the file.
+///
+/// Touched files light up at full chroma on their own directory's hue; every
+/// other file falls back to the dim unchanged tint. Keeping the rest visible
+/// rather than blacking it out is the point: a change set reads as a shape
+/// *within* the codebase, and you can see how much of the repo it covers.
+pub struct LogColorizer {
+    pub palette: StatusPalette,
+}
+
+impl Colorizer for LogColorizer {
+    fn color(&self, tree: &Tree, id: NodeId, data: &MapData) -> Rgb {
+        let touched = data.commit_paths.contains(&tree.node(id).path);
+        // Reuse the staged intensity for touched files: it is the brightest
+        // non-conflict step, and "this commit changed it" is the same kind of
+        // claim as "this is staged".
+        let change = if touched {
+            Change::Modified
+        } else {
+            Change::None
+        };
+        self.palette.color_at_hue(tree.hue_of(id), change, touched)
+    }
+
+    fn legend(&self) -> Vec<(&'static str, Rgb)> {
+        vec![("touched by this commit", self.palette.modified)]
+    }
+
+    fn name(&self) -> &'static str {
+        "log"
+    }
+
+    fn uses_tree_hue(&self) -> bool {
+        true
     }
 }
 
@@ -549,6 +596,35 @@ mod tests {
         let _ = render_hover(&t, &l, Some(a));
         let after = render_hover(&t, &l, None);
         assert_eq!(first.px, after.px, "colours drifted after a hover");
+    }
+
+    #[test]
+    fn heatmap_separates_recent_from_ancient_from_unknown() {
+        // Three distinct answers: recently touched, long untouched, and no
+        // history at all. The third must not masquerade as the second.
+        let t = Tree::build(
+            &[
+                (PathBuf::from("recent.rs"), 100),
+                (PathBuf::from("old.rs"), 100),
+                (PathBuf::from("unknown.rs"), 100),
+            ],
+            Scale::Linear,
+        );
+        let mut d = MapData::new();
+        d.age.insert(PathBuf::from("recent.rs"), 3600);
+        d.age.insert(PathBuf::from("old.rs"), 400 * 24 * 3600);
+        let c = HeatColorizer {
+            palette: StatusPalette::default(),
+        };
+        let l = |n: &str| {
+            palette::to_oklab(c.color(&t, t.find(std::path::Path::new(n)).unwrap(), &d)).l
+        };
+        let (r, o, u) = (l("recent.rs"), l("old.rs"), l("unknown.rs"));
+        assert!(r > o, "recent {r} should be brighter than old {o}");
+        assert!(
+            (u - o).abs() > 0.02,
+            "a file with no history ({u}) must not look like an ancient one ({o})"
+        );
     }
 
     #[test]

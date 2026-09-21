@@ -9,14 +9,14 @@ use std::path::PathBuf;
 
 /// Build a `PathBuf` from raw bytes without going through `str`.
 #[cfg(unix)]
-fn path_from_bytes(b: &[u8]) -> PathBuf {
+pub fn path_from_bytes(b: &[u8]) -> PathBuf {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     PathBuf::from(OsStr::from_bytes(b))
 }
 
 #[cfg(not(unix))]
-fn path_from_bytes(b: &[u8]) -> PathBuf {
+pub fn path_from_bytes(b: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(b).into_owned())
 }
 
@@ -225,6 +225,62 @@ pub fn log(data: &[u8]) -> Vec<CommitMeta> {
     out
 }
 
+/// Parse `git log --format=%H%x00%at --name-only -z --no-renames`.
+///
+/// The stream is flat and NUL-separated, but the record boundary is a newline
+/// rather than a NUL: git emits `<oid>NUL<time>\n<path>NUL<path>NUL<oid>NUL...`,
+/// so the timestamp and the commit's *first* path arrive in one field. A commit
+/// that touched nothing (an empty commit, or a merge) has no trailing newline
+/// on its time field at all.
+///
+/// Returns, per path, the time it was last touched and how many commits in the
+/// walk touched it — the age and churn inputs the heatmap needs.
+pub fn history_walk(data: &[u8]) -> Vec<(PathBuf, i64, u32)> {
+    use std::collections::HashMap;
+    let mut acc: HashMap<PathBuf, (i64, u32)> = HashMap::new();
+
+    let mut fields = data.split(|&b| b == 0).filter(|f| !f.is_empty());
+    let mut time: i64 = 0;
+
+    while let Some(f) = fields.next() {
+        // A bare 40-char hex field starts a commit; its time follows, with the
+        // commit's first path glued on after a newline when it has one.
+        if looks_like_oid(f) {
+            let Some(tf) = fields.next() else { break };
+            let (t, first) = match tf.iter().position(|&b| b == b'\n') {
+                Some(i) => (&tf[..i], Some(&tf[i + 1..])),
+                None => (tf, None),
+            };
+            time = std::str::from_utf8(t)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            if let Some(p) = first
+                && !p.is_empty()
+            {
+                touch(&mut acc, p, time);
+            }
+            continue;
+        }
+        touch(&mut acc, f, time);
+    }
+
+    acc.into_iter().map(|(p, (t, n))| (p, t, n)).collect()
+}
+
+/// Record that `path` was touched at `time`, keeping the newest timestamp.
+fn touch(acc: &mut std::collections::HashMap<PathBuf, (i64, u32)>, path: &[u8], time: i64) {
+    let e = acc.entry(path_from_bytes(path)).or_insert((time, 0));
+    // The walk runs newest first, so the first sighting is the latest touch.
+    e.0 = e.0.max(time);
+    e.1 += 1;
+}
+
+/// Whether a field is a bare 40-char hex oid.
+fn looks_like_oid(f: &[u8]) -> bool {
+    f.len() == 40 && f.iter().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +392,43 @@ mod tests {
             unified_diff("diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n");
         assert!(d.binary);
         assert!(d.hunks.is_empty());
+    }
+
+    #[test]
+    fn history_walk_collects_times_and_counts() {
+        // The shape git actually emits: the time and the first path share one
+        // field, separated by a newline.
+        let data = b"\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x002000\nsrc/a.rs\x00src/b.rs\x00\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x001000\nsrc/a.rs\x00docs/c.md\x00";
+        let mut w = history_walk(data);
+        w.sort_by(|x, y| x.0.cmp(&y.0));
+
+        assert_eq!(w.len(), 3, "got {w:?}");
+        let get = |p: &str| w.iter().find(|e| e.0 == PathBuf::from(p)).unwrap();
+        // a.rs was touched by both commits; its age comes from the newest.
+        assert_eq!(get("src/a.rs").1, 2000);
+        assert_eq!(get("src/a.rs").2, 2, "churn should count both commits");
+        assert_eq!(get("src/b.rs").1, 2000);
+        assert_eq!(get("src/b.rs").2, 1);
+        assert_eq!(get("docs/c.md").1, 1000);
+    }
+
+    #[test]
+    fn history_walk_handles_a_commit_touching_nothing() {
+        // An empty commit or a merge emits a time field with no path glued on.
+        let data = b"\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x003000\x00\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x002000\nonly.rs\x00";
+        let w = history_walk(data);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, PathBuf::from("only.rs"));
+        assert_eq!(w[0].1, 2000, "the empty commit must not claim the file");
+    }
+
+    #[test]
+    fn history_walk_is_empty_for_no_input() {
+        assert!(history_walk(b"").is_empty());
     }
 
     #[test]

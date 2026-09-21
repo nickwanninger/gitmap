@@ -15,8 +15,20 @@ M0 and M1 of the design doc are implemented:
 - Half-block pixel canvas with OKLab colour ramps and truecolor/256/16 fallback
 - Status view: working-tree state across the whole repo, unchanged files kept
   visible so changes read against the mass they sit in
-- Heatmap view scaffold (`Tab`) — the colorizer is in place; the history walk
-  that feeds it is M2
+- A tab bar across the top of the side pane showing all three views at once,
+  each with a line saying what it shows. Click a tab, press `1`/`2`/`3`, or
+  cycle with `Tab`
+- Age view: colours each file by how recently it was last committed, on a
+  magma ramp with a log-scaled time axis. Backed by a real history walk
+  (`git log --name-only`), which also yields per-file churn. Files with no
+  history render as a cold neutral rather than borrowing the ramp's dark end,
+  so "untracked" never reads as "ancient". The pane reports the hovered file's
+  last-touched time and commit count
+- History view: a braille commits-per-day strip coloured on GitHub's
+  contribution greens, a scrollable commit list, and the selected commit's
+  diff. The map colours the files that commit touched, leaving the rest dim but
+  visible, so a change set reads as a shape within the codebase. `j`/`k` move
+  the selection, `Ctrl+D`/`Ctrl+U` scroll the diff, `y` yanks the SHA
 - Per-directory hue: each directory owns an arc of the hue circle sized by its
   share of the repo, and its subdirectories recursively subdivide that arc.
   Files inherit their directory's hue, so a folder reads as one colour family
@@ -35,9 +47,9 @@ M0 and M1 of the design doc are implemented:
 - Keyboard navigation as a first-class equal: `n`/`p`, `/`, `j`/`k`
 - Panic hook that restores the terminal
 
-Not yet implemented: the history walk and its on-disk cache (M2), the log and
-timeline views (M3), hunk-level staging and syntax highlighting (M4), the `gix`
-backend, and circle-pack layout.
+Not yet implemented: the history walk's on-disk incremental cache (M2), range
+selection and timeline scrubbing in the log view (M3), hunk-level staging and
+syntax highlighting (M4), the `gix` backend, and circle-pack layout.
 
 ## Build and run
 
@@ -64,8 +76,10 @@ Options:
 | `c` | commit prompt (`Ctrl+A` toggles `--amend`) |
 | `n` / `p` | next / previous changed file in path order |
 | `/` | find a file by name |
-| `j` / `k` | scroll the diff |
-| `Tab` | cycle view |
+| `Tab` / `Shift+Tab` | cycle view: status → heatmap → log |
+| `1` / `2` / `3` | jump straight to a view |
+| `j` / `k` | scroll the diff, or move the log selection |
+| `Ctrl+D` / `Ctrl+U` | scroll the commit diff in the log view |
 | `\|` / `-` | force vertical / horizontal split |
 | `u` | undo the last staging action |
 | `?` | help |
@@ -88,7 +102,7 @@ src/
   worker.rs        the git worker thread
   git/             GitBackend trait, porcelain impl, -z/porcelain=v2 parsers
   layout/          path list → tree, squarified treemap
-  render/          pixel canvas, OKLab palette, map widget, diff pane
+  render/          pixel canvas, OKLab palette, map widget, diff pane, timeline
   input/           hit buffer
 ```
 

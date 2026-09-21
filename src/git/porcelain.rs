@@ -186,6 +186,40 @@ impl GitBackend for PorcelainBackend {
         Ok(parse::log(&out))
     }
 
+    fn paths_in_commit(&self, oid: &str) -> Result<Vec<PathBuf>> {
+        // `--name-only --format=` with -z gives a bare NUL-separated path list.
+        // A merge commit reports nothing by default, which is the right answer
+        // here: its own diff against the first parent is what the log shows,
+        // and `git show` on a merge is empty unless asked for a combined diff.
+        let out = self.read(&["show", "--name-only", "--format=", "-z", oid])?;
+        Ok(out
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(parse::path_from_bytes)
+            .collect())
+    }
+
+    fn commit_diff(&self, oid: &str) -> Result<Diff> {
+        let out = self.read(&["show", "--no-color", "--no-ext-diff", "--format=", oid])?;
+        Ok(parse::unified_diff(&String::from_utf8_lossy(&out)))
+    }
+
+    fn history(&self, limit: usize) -> Result<Vec<(PathBuf, i64, u32)>> {
+        // `--no-renames` keeps the parse simple; rename detection changes the
+        // map's semantics and is a deliberate later decision.
+        let n = limit.to_string();
+        let out = self.read(&[
+            "log",
+            "--format=%H%x00%at",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "-n",
+            &n,
+        ])?;
+        Ok(parse::history_walk(&out))
+    }
+
     fn stage(&self, path: &Path) -> Result<()> {
         // `-A` so a deletion stages as a deletion rather than being ignored.
         self.write_cmd(&["add", "-A", "--", &arg(path)])?;

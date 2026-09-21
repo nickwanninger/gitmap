@@ -5,13 +5,13 @@
 //! draws once — event-driven rather than a fixed-rate loop, which matters for
 //! battery and for SSH.
 
-use crate::git::{Change, Diff, FileStatus, HeadInfo};
+use crate::git::{Change, CommitMeta, Diff, FileStatus, HeadInfo};
 use crate::input::hit::HitBuffer;
 use crate::layout::tree::{NodeId, Scale, Tree};
 use crate::layout::treemap::{self, Layout, Rect as PxRect};
 use crate::render::canvas::Canvas;
-use crate::render::palette::{ColorDepth, StatusPalette};
-use crate::render::{diff as diffpane, map};
+use crate::render::palette::{self, ColorDepth, StatusPalette};
+use crate::render::{diff as diffpane, map, timeline};
 use crate::worker::{Message, Request};
 
 use anyhow::Result;
@@ -24,7 +24,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -43,6 +43,20 @@ const COALESCE: Duration = Duration::from_millis(8);
 /// every extra column into pixels.
 const DIFF_MAX_COLS: u16 = 82;
 
+/// How many commits the log view loads.
+///
+/// Deep enough to browse recent history without paying for a full walk of a
+/// large repository; the design doc's incremental history cache is what makes
+/// going deeper cheap, and that is M2 work.
+const LOG_LIMIT: usize = 200;
+
+/// How many commits the heatmap's history walk covers.
+///
+/// Deeper than the log because age wants the whole recent past, but still
+/// bounded: the design doc's on-disk incremental cache is what makes a full
+/// walk of a large repository affordable, and that is still to come.
+const HISTORY_LIMIT: usize = 2000;
+
 /// Split direction. Diffs want width, maps want square.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Split {
@@ -55,6 +69,36 @@ pub enum Split {
 pub enum View {
     Status,
     Heatmap,
+    Log,
+}
+
+impl View {
+    /// Every view, in tab-bar and cycle order.
+    pub const ALL: [View; 3] = [View::Status, View::Heatmap, View::Log];
+
+    /// Cycle order for `Tab`.
+    fn next(self) -> View {
+        let i = Self::ALL.iter().position(|&v| v == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// Short name for the tab bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            View::Status => "changes",
+            View::Heatmap => "age",
+            View::Log => "history",
+        }
+    }
+
+    /// One line saying what the view is for, shown under the tabs.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            View::Status => "what you have changed since HEAD",
+            View::Heatmap => "how recently each file was last committed",
+            View::Log => "commits, and which files each one touched",
+        }
+    }
 }
 
 /// A modal overlay owning the keyboard.
@@ -88,6 +132,20 @@ pub struct App {
     pub diff: Option<(PathBuf, Diff)>,
     pub diff_scroll: u16,
 
+    /// Commit metadata, newest first. Loaded when the log view is first opened.
+    pub log: Vec<CommitMeta>,
+    /// Index into `log` of the highlighted commit.
+    pub log_sel: usize,
+    /// First visible row, so the selection can scroll without moving.
+    log_top: usize,
+    /// Files touched by the selected commit, and its diff.
+    pub commit_paths: HashSet<PathBuf>,
+    commit_diff: Option<Diff>,
+    /// Tags commit-detail requests so stale replies are dropped.
+    detail_seq: u64,
+    /// Set once the heatmap's history walk has been requested.
+    history_loaded: bool,
+
     pub view: View,
     pub split: Split,
     pub modal: Modal,
@@ -107,6 +165,7 @@ pub struct App {
     /// Geometry the current layout was computed for.
     laid_out_for: (u16, u16),
     map_area: Rect,
+    tab_area: Rect,
     pub should_quit: bool,
     pub dirty: bool,
 }
@@ -128,6 +187,13 @@ impl App {
             pinned: None,
             diff: None,
             diff_scroll: 0,
+            log: Vec::new(),
+            log_sel: 0,
+            log_top: 0,
+            commit_paths: HashSet::new(),
+            commit_diff: None,
+            detail_seq: 0,
+            history_loaded: false,
             view: View::Status,
             split: Split::Auto,
             modal: Modal::None,
@@ -141,6 +207,7 @@ impl App {
             pending_hover: None,
             laid_out_for: (0, 0),
             map_area: Rect::new(0, 0, 0, 0),
+            tab_area: Rect::new(0, 0, 0, 0),
             should_quit: false,
             dirty: true,
         }
@@ -262,6 +329,41 @@ impl App {
                 // The file under the cursor just changed sides.
                 self.request_diff();
             }
+            Message::History(entries) => {
+                // Ages are relative to now, so they are computed once here
+                // rather than on every redraw.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                self.data.age = entries
+                    .iter()
+                    .map(|(p, t, _)| (p.clone(), (now - t).max(0)))
+                    .collect();
+                self.data.churn = entries.into_iter().map(|(p, _, n)| (p, n)).collect();
+                self.history_loaded = true;
+            }
+            Message::Log(commits) => {
+                self.log = commits;
+                self.log_sel = 0;
+                self.log_top = 0;
+                self.request_commit_detail();
+            }
+            Message::CommitDetail {
+                oid,
+                paths,
+                diff,
+                seq,
+            } => {
+                // Drop a reply for a selection the user has already moved past.
+                if seq == self.detail_seq {
+                    self.commit_paths = paths.into_iter().collect();
+                    self.commit_diff = Some(diff);
+                    self.data.commit_paths = self.commit_paths.clone();
+                    self.diff_scroll = 0;
+                    let _ = oid;
+                }
+            }
             Message::Error(e) => {
                 self.modal = Modal::Error(e);
             }
@@ -374,6 +476,16 @@ impl App {
                 self.should_quit = true
             }
             KeyCode::Char('?') => self.modal = Modal::Help,
+            // Jump straight to a view; the digits match the tab bar.
+            KeyCode::Char(c @ '1'..='3') => {
+                let i = c as usize - '1' as usize;
+                if let Some(&v) = View::ALL.get(i)
+                    && v != self.view
+                {
+                    self.view = v;
+                    self.on_view_changed();
+                }
+            }
             KeyCode::Char(' ') => self.toggle_stage(),
             KeyCode::Char('a') => self.stage_under_cursor(),
             KeyCode::Char('c') => {
@@ -382,12 +494,19 @@ impl App {
                     amend: false,
                 }
             }
+            // Ctrl+U before plain `u`, or undo swallows the scroll binding.
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.diff_scroll = self.diff_scroll.saturating_sub(5)
+            }
             KeyCode::Char('u') => self.undo_last(),
             KeyCode::Tab => {
-                self.view = match self.view {
-                    View::Status => View::Heatmap,
-                    View::Heatmap => View::Status,
-                };
+                self.view = self.view.next();
+                self.on_view_changed();
+            }
+            KeyCode::BackTab => {
+                // Shift+Tab walks the cycle backwards.
+                self.view = self.view.next().next();
+                self.on_view_changed();
             }
             KeyCode::Char('|') => self.split = Split::Vertical,
             KeyCode::Char('-') => self.split = Split::Horizontal,
@@ -402,12 +521,25 @@ impl App {
             KeyCode::Char('n') => self.step_changed(1),
             KeyCode::Char('p') => self.step_changed(-1),
             KeyCode::Char('j') | KeyCode::Down => {
-                self.diff_scroll = self.diff_scroll.saturating_add(1)
+                if self.view == View::Log {
+                    self.step_commit(1);
+                } else {
+                    self.diff_scroll = self.diff_scroll.saturating_add(1);
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.diff_scroll = self.diff_scroll.saturating_sub(1)
+                if self.view == View::Log {
+                    self.step_commit(-1);
+                } else {
+                    self.diff_scroll = self.diff_scroll.saturating_sub(1);
+                }
             }
-            KeyCode::Char('y') => self.yank_path(),
+            // In the log view j/k drive the selection, so the diff underneath
+            // scrolls with Ctrl+D / Ctrl+U instead.
+            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.diff_scroll = self.diff_scroll.saturating_add(5)
+            }
+            KeyCode::Char('y') => self.yank(),
             KeyCode::Enter => self.pinned = self.hovered,
             KeyCode::Esc => {
                 self.pinned = None;
@@ -421,6 +553,14 @@ impl App {
         match m.kind {
             MouseEventKind::Moved => self.on_motion(m),
             MouseEventKind::Down(MouseButton::Left) => {
+                // A click on the tab bar switches view rather than pinning.
+                if let Some(v) = self.tab_at(m.column, m.row) {
+                    if v != self.view {
+                        self.view = v;
+                        self.on_view_changed();
+                    }
+                    return;
+                }
                 self.on_motion(m);
                 self.pinned = self.hovered;
                 self.request_diff();
@@ -473,6 +613,58 @@ impl App {
             staged,
             seq: self.diff_seq,
         });
+    }
+
+    /// React to a view switch: the log needs its data fetched the first time.
+    fn on_view_changed(&mut self) {
+        self.diff_scroll = 0;
+        if self.view == View::Heatmap && !self.history_loaded {
+            // Lazily loaded, like the log: a session that never opens the
+            // heatmap should not pay for the walk.
+            self.history_loaded = true;
+            let _ = self.tx.send(Request::History {
+                limit: HISTORY_LIMIT,
+            });
+        }
+        if self.view == View::Log {
+            if self.log.is_empty() {
+                // Lazily loaded: a repo the user never opens the log on should
+                // not pay for the walk.
+                let _ = self.tx.send(Request::Log { limit: LOG_LIMIT });
+            } else {
+                self.request_commit_detail();
+            }
+        } else {
+            // Leaving the log clears its highlight so the status and heatmap
+            // views are not tinted by a stale commit selection.
+            self.data.commit_paths.clear();
+        }
+    }
+
+    /// Ask for the selected commit's touched paths and diff.
+    fn request_commit_detail(&mut self) {
+        let Some(c) = self.log.get(self.log_sel) else {
+            return;
+        };
+        self.detail_seq += 1;
+        let _ = self.tx.send(Request::CommitDetail {
+            oid: c.oid.clone(),
+            seq: self.detail_seq,
+        });
+    }
+
+    /// Move the log selection, keeping it on screen.
+    fn step_commit(&mut self, delta: i32) {
+        if self.log.is_empty() {
+            return;
+        }
+        let n = self.log.len() as i32;
+        let next = (self.log_sel as i32 + delta).clamp(0, n - 1) as usize;
+        if next == self.log_sel {
+            return;
+        }
+        self.log_sel = next;
+        self.request_commit_detail();
     }
 
     fn toggle_stage(&mut self) {
@@ -600,7 +792,14 @@ impl App {
         }
     }
 
-    fn yank_path(&mut self) {
+    /// `y` yanks the hovered path, or the selected SHA in the log view.
+    fn yank(&mut self) {
+        if self.view == View::Log {
+            if let Some(c) = self.log.get(self.log_sel) {
+                self.message = c.oid.clone();
+            }
+            return;
+        }
         match self.target() {
             Some(id) => {
                 let p = self.tree.node(id).path.display().to_string();
@@ -639,6 +838,9 @@ impl App {
                 palette: StatusPalette::default(),
             }),
             View::Heatmap => Box::new(map::HeatColorizer {
+                palette: StatusPalette::default(),
+            }),
+            View::Log => Box::new(map::LogColorizer {
                 palette: StatusPalette::default(),
             }),
         };
@@ -700,14 +902,46 @@ impl App {
         }
     }
 
-    fn draw_side(&self, f: &mut Frame, area: Rect) {
-        let title = match self.view {
-            View::Status => " diff ",
-            View::Heatmap => " heatmap ",
-        };
-        let block = Block::default().borders(Borders::ALL).title(title);
+    fn draw_side(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::default().borders(Borders::ALL);
         let inner = block.inner(area);
         f.render_widget(block, area);
+
+        // Tab bar, then a one-line description of what the view shows. The
+        // description is what makes "age" mean something without having to
+        // press the key and guess from the colours.
+        let rows = TuiLayout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+        self.tab_area = rows[0];
+        self.draw_tabs(f, rows[0]);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                self.view.blurb(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ))),
+            rows[1],
+        );
+        let inner = rows[2];
+
+        if self.view == View::Log {
+            self.draw_log(f, inner);
+            return;
+        }
+
+        // In the heatmap the diff is beside the point: what the view claims
+        // about a file is its age and churn, so that is what it should show.
+        if self.view == View::Heatmap {
+            self.draw_age_pane(f, inner);
+            return;
+        }
 
         let lines = match (&self.diff, self.target()) {
             (Some((path, d)), _) => diffpane::lines(d, &path.display().to_string()),
@@ -736,6 +970,209 @@ impl App {
                 .scroll((self.diff_scroll, 0))
                 .wrap(Wrap { trim: false }),
             inner,
+        );
+    }
+
+    /// The heatmap's pane: when the hovered file was last committed, and how
+    /// often it has been touched.
+    fn draw_age_pane(&self, f: &mut Frame, area: Rect) {
+        let mut lines = Vec::new();
+        match self.target() {
+            Some(id) => {
+                let path = self.tree.node(id).path.clone();
+                lines.push(Line::from(Span::styled(
+                    path.display().to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+                match self.data.age.get(&path) {
+                    Some(&age) => {
+                        lines.push(Line::from(format!("last touched  {}", human_age(age))));
+                        let churn = self.data.churn.get(&path).copied().unwrap_or(0);
+                        lines.push(Line::from(format!("commits       {churn}")));
+                    }
+                    None if self.data.age.is_empty() => lines.push(Line::from(Span::styled(
+                        "walking history…",
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    None => lines.push(Line::from(Span::styled(
+                        "no commits touch this file",
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                }
+            }
+            None => lines.push(Line::from(Span::styled(
+                "hover a block to see when it last changed",
+                Style::default().fg(Color::DarkGray),
+            ))),
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    /// Draw the view tabs, so every view is visible rather than being a name
+    /// that only appears once you have already switched to it.
+    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
+        let mut spans = Vec::new();
+        for (i, v) in View::ALL.iter().enumerate() {
+            let selected = *v == self.view;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            // The digit doubles as the shortcut that jumps straight here.
+            spans.push(Span::styled(format!(" {} {} ", i + 1, v.label()), style));
+            spans.push(Span::raw(" "));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Which tab, if any, sits under a cell. Used for click-to-switch.
+    fn tab_at(&self, col: u16, row: u16) -> Option<View> {
+        let a = self.tab_area;
+        if row != a.y || col < a.x {
+            return None;
+        }
+        let mut x = a.x;
+        for v in View::ALL {
+            // Width must match `draw_tabs`: " N label " plus one space.
+            let w = v.label().chars().count() as u16 + 5;
+            if col >= x && col < x + w - 1 {
+                return Some(v);
+            }
+            x += w;
+        }
+        None
+    }
+
+    /// The log pane: a braille commits-per-day strip, the commit list, and the
+    /// selected commit's diff underneath.
+    fn draw_log(&mut self, f: &mut Frame, area: Rect) {
+        if self.log.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "loading history…",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                area,
+            );
+            return;
+        }
+
+        // Strip on top, list in the middle, diff below. The list gets a fixed
+        // share so the diff always has room to be useful.
+        let list_h = (area.height.saturating_sub(3) / 2).clamp(1, 14);
+        let rows = TuiLayout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(list_h),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        self.draw_timeline(f, rows[0]);
+        self.draw_commit_list(f, rows[1]);
+        self.draw_commit_diff(f, rows[2]);
+    }
+
+    fn draw_timeline(&self, f: &mut Frame, area: Rect) {
+        let times: Vec<i64> = self.log.iter().map(|c| c.time).collect();
+        let (counts, day_of) = timeline::commits_per_day(&times);
+        // One span per cell so each can take its own green: colour tracks how
+        // busy the day was, the same way a contribution graph reads, and the
+        // braille dot height carries the same signal a second time.
+        let strip: Vec<Span> = timeline::cells(&counts, area.width)
+            .into_iter()
+            .map(|c| {
+                let g = palette::contrib_green(c.level);
+                Span::styled(
+                    c.ch.to_string(),
+                    Style::default().fg(Color::Rgb(g.0, g.1, g.2)),
+                )
+            })
+            .collect();
+
+        // Mark roughly where the selection sits along the strip.
+        let mut marker = " ".repeat(area.width as usize);
+        if let Some(&day) = day_of.get(self.log_sel)
+            && !counts.is_empty()
+            && area.width > 0
+        {
+            let col = day * area.width as usize / counts.len().max(1);
+            let col = col.min(area.width as usize - 1);
+            marker.replace_range(col..col + 1, "▲");
+        }
+
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(strip),
+                Line::from(Span::styled(marker, Style::default().fg(Color::Cyan))),
+            ]),
+            area,
+        );
+    }
+
+    fn draw_commit_list(&mut self, f: &mut Frame, area: Rect) {
+        // Keep the selection on screen without moving it more than necessary.
+        let h = area.height.max(1) as usize;
+        if self.log_sel < self.log_top {
+            self.log_top = self.log_sel;
+        } else if self.log_sel >= self.log_top + h {
+            self.log_top = self.log_sel + 1 - h;
+        }
+
+        let mut lines = Vec::with_capacity(h);
+        for (i, c) in self.log.iter().enumerate().skip(self.log_top).take(h) {
+            let selected = i == self.log_sel;
+            let short = &c.oid[..c.oid.len().min(7)];
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let text = format!(
+                "{} {} {}",
+                if selected { "▸" } else { " " },
+                short,
+                c.subject
+            );
+            // Pad so the selection highlight spans the pane.
+            let text = format!("{text:<w$}", w = area.width as usize);
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn draw_commit_diff(&self, f: &mut Frame, area: Rect) {
+        let Some(c) = self.log.get(self.log_sel) else {
+            return;
+        };
+        let lines = match &self.commit_diff {
+            Some(d) => {
+                let header = format!(
+                    "{} · {} · {} file(s)",
+                    &c.oid[..c.oid.len().min(8)],
+                    c.author,
+                    self.commit_paths.len()
+                );
+                diffpane::lines(d, &header)
+            }
+            None => vec![Line::from(Span::styled(
+                "loading…",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        };
+        f.render_widget(
+            Paragraph::new(lines)
+                .scroll((self.diff_scroll, 0))
+                .wrap(Wrap { trim: false }),
+            area,
         );
     }
 
@@ -778,9 +1215,19 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ));
         } else {
-            let hint = match self.target() {
-                Some(id) => self.tree.node(id).path.display().to_string(),
-                None => "space stage · a stage dir · c commit · Tab view · ? help".into(),
+            let hint = if self.view == View::Log {
+                match self.log.get(self.log_sel) {
+                    Some(c) => format!(
+                        "{}  j/k commit · Ctrl+D/U diff · y sha · Tab view",
+                        c.subject
+                    ),
+                    None => "j/k commit · Tab view · ? help".into(),
+                }
+            } else {
+                match self.target() {
+                    Some(id) => self.tree.node(id).path.display().to_string(),
+                    None => "space stage · a stage dir · c commit · Tab view · ? help".into(),
+                }
             };
             spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
         }
@@ -864,6 +1311,26 @@ impl App {
     }
 }
 
+/// Render a duration in seconds as the coarsest unit that still says
+/// something: "3 days ago" is more use than "271,442 seconds ago".
+fn human_age(secs: i64) -> String {
+    const MIN: i64 = 60;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    let s = secs.max(0);
+    let (n, unit) = match s {
+        _ if s < MIN => (s, "second"),
+        _ if s < HOUR => (s / MIN, "minute"),
+        _ if s < DAY => (s / HOUR, "hour"),
+        _ if s < MONTH => (s / DAY, "day"),
+        _ if s < YEAR => (s / MONTH, "month"),
+        _ => (s / YEAR, "year"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
 const HELP: &str = "\
 mouse move   hover: highlight + diff
 click        pin the hovered file
@@ -872,10 +1339,13 @@ a            stage everything under the hovered directory
 c            commit prompt
 n / p        next / previous changed file
 /            find a file by name
-j / k        scroll the diff
-Tab          cycle view: status → heatmap
+j / k        scroll the diff, or move the log selection
+Ctrl+D / U   scroll the commit diff in the log view
+Tab          cycle view: changes → age → history
+Shift+Tab    cycle the other way
+1 / 2 / 3    jump straight to a view (or click its tab)
 | / -        force vertical / horizontal split
-y            show the hovered path (Shift-drag to select)
+y            show the hovered path, or the commit SHA in the log view
 u            undo the last staging action
 Esc          unpin
 q            quit
@@ -920,6 +1390,7 @@ fn crossbeam_select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::mpsc;
 
     fn app() -> (App, mpsc::Receiver<Request>) {
@@ -1081,6 +1552,217 @@ mod tests {
         // Tall terminal: stacked.
         let (m, s, _) = a.split_areas(Rect::new(0, 0, 80, 60));
         assert!(m.y < s.y, "tall should split horizontally");
+    }
+
+    fn commits(n: usize) -> Vec<CommitMeta> {
+        (0..n)
+            .map(|i| CommitMeta {
+                oid: format!("{:040x}", i),
+                time: 1_700_000_000 + i as i64 * 86_400,
+                author: "t".into(),
+                subject: format!("commit {i}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn human_age_picks_a_sensible_unit() {
+        assert_eq!(human_age(30), "30 seconds ago");
+        assert_eq!(human_age(60), "1 minute ago");
+        assert_eq!(human_age(3 * 3600), "3 hours ago");
+        assert_eq!(human_age(2 * 86_400), "2 days ago");
+        assert_eq!(human_age(60 * 86_400), "2 months ago");
+        assert_eq!(human_age(800 * 86_400), "2 years ago");
+        // Never negative, whatever clock skew produces.
+        assert_eq!(human_age(-5), "0 seconds ago");
+    }
+
+    #[test]
+    fn every_view_has_a_label_and_a_blurb() {
+        // The tab bar is what makes the views discoverable, so each needs a
+        // short name and a line saying what it actually shows.
+        for v in View::ALL {
+            assert!(!v.label().is_empty());
+            assert!(v.blurb().len() > 10, "{:?} has no useful blurb", v);
+        }
+        // Labels must be distinct or the tabs are ambiguous.
+        let mut seen: Vec<&str> = View::ALL.iter().map(|v| v.label()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), View::ALL.len());
+    }
+
+    #[test]
+    fn digits_jump_straight_to_a_view() {
+        let (mut a, _rx) = app();
+        a.on_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(a.view, View::Log);
+        a.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(a.view, View::Status);
+        a.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(a.view, View::Heatmap);
+    }
+
+    #[test]
+    fn opening_the_heatmap_requests_history_once() {
+        let (mut a, rx) = app();
+        a.view = View::Heatmap;
+        a.on_view_changed();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::History { .. })),
+            "the heatmap needs its history walk"
+        );
+        // Going away and coming back must not re-walk.
+        a.view = View::Status;
+        a.on_view_changed();
+        a.view = View::Heatmap;
+        a.on_view_changed();
+        assert!(rx.try_recv().is_err(), "history should be fetched once");
+    }
+
+    #[test]
+    fn history_fills_age_and_churn() {
+        let (mut a, _rx) = app();
+        a.on_message(Message::History(vec![
+            (PathBuf::from("a.rs"), 1_700_000_000, 4),
+            (PathBuf::from("b.rs"), 1_600_000_000, 1),
+        ]));
+        assert_eq!(a.data.age.len(), 2);
+        assert_eq!(a.data.churn[Path::new("a.rs")], 4);
+        // Ages are seconds-since, so the older file has the larger value.
+        assert!(a.data.age[Path::new("b.rs")] > a.data.age[Path::new("a.rs")]);
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_view() {
+        let (mut a, _rx) = app();
+        a.tab_area = Rect::new(0, 0, 40, 1);
+        // Tab 1 starts at x=0; tab 2 begins after " 1 changes " plus a space.
+        let first = a.tab_at(1, 0);
+        assert_eq!(first, Some(View::Status));
+        let second_x = View::Status.label().chars().count() as u16 + 5 + 1;
+        assert_eq!(a.tab_at(second_x, 0), Some(View::Heatmap));
+        // Rows other than the bar are not tabs.
+        assert_eq!(a.tab_at(1, 5), None);
+    }
+
+    #[test]
+    fn tab_cycles_all_three_views() {
+        let (mut a, _rx) = app();
+        assert_eq!(a.view, View::Status);
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.view, View::Heatmap);
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.view, View::Log);
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.view, View::Status, "Tab should wrap");
+    }
+
+    #[test]
+    fn shift_tab_cycles_backwards() {
+        let (mut a, _rx) = app();
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(a.view, View::Log);
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(a.view, View::Heatmap);
+    }
+
+    #[test]
+    fn opening_the_log_requests_it_once() {
+        let (mut a, rx) = app();
+        a.view = View::Log;
+        a.on_view_changed();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Log { .. })),
+            "entering the log should fetch it"
+        );
+
+        // With the log already loaded, re-entering asks only for the detail of
+        // the current selection, not the whole log again.
+        a.log = commits(3);
+        a.on_view_changed();
+        assert!(matches!(rx.try_recv(), Ok(Request::CommitDetail { .. })));
+        assert!(rx.try_recv().is_err(), "no second log request");
+    }
+
+    #[test]
+    fn j_and_k_move_the_log_selection() {
+        let (mut a, rx) = app();
+        a.view = View::Log;
+        a.log = commits(5);
+        while rx.try_recv().is_ok() {}
+
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.log_sel, 1);
+        assert!(matches!(rx.try_recv(), Ok(Request::CommitDetail { .. })));
+        a.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(a.log_sel, 0);
+    }
+
+    #[test]
+    fn log_selection_clamps_at_both_ends() {
+        let (mut a, _rx) = app();
+        a.view = View::Log;
+        a.log = commits(3);
+        a.step_commit(-1);
+        assert_eq!(a.log_sel, 0, "should not run off the newest end");
+        for _ in 0..10 {
+            a.step_commit(1);
+        }
+        assert_eq!(a.log_sel, 2, "should stop at the oldest commit");
+    }
+
+    #[test]
+    fn j_still_scrolls_the_diff_outside_the_log() {
+        let (mut a, _rx) = app();
+        a.view = View::Status;
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.diff_scroll, 1);
+        assert_eq!(a.log_sel, 0, "status view must not move a log selection");
+    }
+
+    #[test]
+    fn stale_commit_details_are_dropped() {
+        let (mut a, _rx) = app();
+        a.detail_seq = 4;
+        a.on_message(Message::CommitDetail {
+            oid: "old".into(),
+            paths: vec![PathBuf::from("stale.rs")],
+            diff: Diff::default(),
+            seq: 2,
+        });
+        assert!(
+            a.commit_paths.is_empty(),
+            "a superseded selection must not repaint the map"
+        );
+        a.on_message(Message::CommitDetail {
+            oid: "cur".into(),
+            paths: vec![PathBuf::from("fresh.rs")],
+            diff: Diff::default(),
+            seq: 4,
+        });
+        assert!(a.commit_paths.contains(Path::new("fresh.rs")));
+    }
+
+    #[test]
+    fn leaving_the_log_clears_the_commit_highlight() {
+        // Otherwise the status view would stay tinted by a stale selection.
+        let (mut a, _rx) = app();
+        a.view = View::Log;
+        a.data.commit_paths.insert(PathBuf::from("x.rs"));
+        a.view = View::Status;
+        a.on_view_changed();
+        assert!(a.data.commit_paths.is_empty());
+    }
+
+    #[test]
+    fn y_yanks_the_sha_in_the_log_view() {
+        let (mut a, _rx) = app();
+        a.view = View::Log;
+        a.log = commits(2);
+        a.log_sel = 1;
+        a.yank();
+        assert_eq!(a.message, a.log[1].oid);
     }
 
     #[test]

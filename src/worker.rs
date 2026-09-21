@@ -4,7 +4,7 @@
 //! concurrent `index.lock` contention, and the main thread never blocks on I/O
 //! — that single invariant is what keeps the UI responsive.
 
-use crate::git::{Diff, FileStatus, GitBackend, HeadInfo, TreeEntry};
+use crate::git::{CommitMeta, Diff, FileStatus, GitBackend, HeadInfo, TreeEntry};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -26,6 +26,21 @@ pub enum Request {
         message: String,
         amend: bool,
     },
+    /// Commit metadata for the log view.
+    Log {
+        limit: usize,
+    },
+    /// The history walk behind the heatmap.
+    History {
+        limit: usize,
+    },
+    /// Which files a commit touched, plus its diff for the pane. Tagged with a
+    /// sequence number so a result for a selection the user has already moved
+    /// past is dropped, exactly as hover diffs are.
+    CommitDetail {
+        oid: String,
+        seq: u64,
+    },
     Quit,
 }
 
@@ -37,6 +52,14 @@ pub enum Message {
     Tree(Vec<TreeEntry>),
     Diff {
         path: PathBuf,
+        diff: Diff,
+        seq: u64,
+    },
+    Log(Vec<CommitMeta>),
+    History(Vec<(std::path::PathBuf, i64, u32)>),
+    CommitDetail {
+        oid: String,
+        paths: Vec<std::path::PathBuf>,
         diff: Diff,
         seq: u64,
     },
@@ -94,6 +117,22 @@ fn handle(backend: &dyn GitBackend, req: Request, tx: &Sender<Message>) -> anyho
                 backend.stage(p)?;
             }
             let _ = tx.send(Message::Done(format!("staged {n} files")));
+        }
+        Request::Log { limit } => {
+            let _ = tx.send(Message::Log(backend.log(limit)?));
+        }
+        Request::History { limit } => {
+            let _ = tx.send(Message::History(backend.history(limit)?));
+        }
+        Request::CommitDetail { oid, seq } => {
+            let paths = backend.paths_in_commit(&oid)?;
+            let diff = backend.commit_diff(&oid)?;
+            let _ = tx.send(Message::CommitDetail {
+                oid,
+                paths,
+                diff,
+                seq,
+            });
         }
         Request::Commit { message, amend } => {
             let oid = backend.commit(&message, amend)?;

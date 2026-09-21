@@ -155,8 +155,14 @@ pub trait GitBackend: Send + Sync {
     fn tree_at_head(&self) -> Result<Vec<TreeEntry>>;
     fn diff(&self, path: &Path, staged: bool) -> Result<Diff>;
     fn head(&self) -> Result<HeadInfo>;
-    #[allow(dead_code)]
     fn log(&self, limit: usize) -> Result<Vec<CommitMeta>>;
+    /// Paths a commit touched, for colouring the map in the log view.
+    fn paths_in_commit(&self, oid: &str) -> Result<Vec<PathBuf>>;
+    /// The full diff of a commit against its first parent.
+    fn commit_diff(&self, oid: &str) -> Result<Diff>;
+    /// One history walk: per path, when it was last touched and by how many
+    /// commits. Feeds the heatmap.
+    fn history(&self, limit: usize) -> Result<Vec<(PathBuf, i64, u32)>>;
 
     fn stage(&self, path: &Path) -> Result<()>;
     fn unstage(&self, path: &Path) -> Result<()>;
