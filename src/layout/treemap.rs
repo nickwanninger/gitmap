@@ -55,14 +55,6 @@ pub struct Layout {
 /// hoverable target, so the subtree collapses into one aggregate block instead.
 const MIN_PX: f64 = 2.0;
 
-/// Reserve the top pixel row of a directory for its label tint, giving visual
-/// grouping without drawing borders that would eat pixels.
-const LABEL_PX: f64 = 2.0;
-
-/// Depth past which directories stop reserving label rows — deep nesting
-/// otherwise spends every pixel on chrome.
-const LABEL_MAX_DEPTH: usize = 2;
-
 pub fn layout(tree: &Tree, area: Rect) -> Layout {
     let mut out = Layout {
         rects: vec![None; tree.len()],
@@ -83,13 +75,13 @@ fn place_children(tree: &Tree, id: NodeId, area: Rect, out: &mut Layout) {
         return;
     }
 
-    // A directory gives up its top pixel row to a label band, but only while
-    // there is room to spare.
-    let mut inner = area;
-    if id != tree.root && node.depth <= LABEL_MAX_DEPTH && area.h > LABEL_PX * 3.0 {
-        inner.y += LABEL_PX;
-        inner.h -= LABEL_PX;
-    }
+    // Children tile their parent exactly. Directories used to reserve a top
+    // pixel band for a label tint, but that band belonged to no leaf, so the
+    // map rendered with 2px discontinuities running through it — most visible
+    // in the age and churn views, where a flat neutral band cuts across a
+    // continuous colour ramp and reads as missing data. Grouping is carried by
+    // hue instead, which costs no pixels.
+    let inner = area;
 
     // Too small to subdivide: collapse the whole subtree into this one block.
     if inner.w < MIN_PX * 2.0 || inner.h < MIN_PX * 2.0 {
@@ -320,6 +312,36 @@ mod tests {
                     ra,
                     rb
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_tile_their_area_without_gaps() {
+        // Regression: directories used to reserve a 2px label band that no leaf
+        // covered, so the map rendered with discontinuities running through it.
+        // Every pixel centre in the area must now belong to some drawn block.
+        let t = sample();
+        for (w, h) in [
+            (200.0, 110.0),
+            (118.0, 64.0),
+            (80.0, 40.0),
+            (60.0, 130.0),
+            (37.0, 23.0),
+        ] {
+            let l = layout(&t, Rect::new(0.0, 0.0, w, h));
+            let drawn: Vec<Rect> = (0..t.len())
+                .filter(|&i| (!t.node(i).is_dir || l.collapsed[i]) && l.rects[i].is_some())
+                .map(|i| l.rects[i].unwrap())
+                .collect();
+            for py in 0..h as usize {
+                for px in 0..w as usize {
+                    let (cx, cy) = (px as f64 + 0.5, py as f64 + 0.5);
+                    assert!(
+                        drawn.iter().any(|r| r.contains(cx, cy)),
+                        "pixel ({px},{py}) uncovered at {w}x{h}"
+                    );
+                }
             }
         }
     }
