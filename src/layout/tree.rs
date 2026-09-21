@@ -37,6 +37,12 @@ pub struct Node {
 pub struct Tree {
     pub nodes: Vec<Node>,
     pub root: NodeId,
+    /// Path to node, so `find` is a hash lookup rather than a scan.
+    ///
+    /// Not an optimisation for its own sake: callers legitimately look up
+    /// thousands of paths against a tree with tens of thousands of nodes, and
+    /// a linear `find` turns that into a quadratic freeze on a large repo.
+    index: HashMap<PathBuf, NodeId>,
 }
 
 /// How a raw size becomes an area weight.
@@ -112,7 +118,12 @@ impl Tree {
             nodes[parent].children.push(id);
         }
 
-        let mut tree = Tree { nodes, root };
+        let index = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.path.clone(), i))
+            .collect();
+        let mut tree = Tree { nodes, root, index };
         tree.sort_children();
         tree.accumulate(root);
         // Weights must be summed before arcs can be sized by them.
@@ -269,7 +280,7 @@ impl Tree {
 
     /// Find the node for a path, if it is in the tree.
     pub fn find(&self, path: &Path) -> Option<NodeId> {
-        self.nodes.iter().position(|n| n.path == path)
+        self.index.get(path).copied()
     }
 }
 

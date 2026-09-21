@@ -34,7 +34,15 @@ use std::time::{Duration, Instant};
 const DIFF_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// Coalescing window: a burst of motion events produces one frame.
+///
+/// This bounds how long a single drain pass may run, not how long to sleep.
 const COALESCE: Duration = Duration::from_millis(8);
+
+/// Most events or messages one drain pass will take from a single channel.
+///
+/// A bound rather than "until empty" so a flooding producer cannot starve the
+/// other channel or the frame that should follow it.
+const DRAIN_MAX: usize = 512;
 
 /// Widest the diff pane may get when the panes sit side by side.
 ///
@@ -145,6 +153,9 @@ pub struct App {
     detail_seq: u64,
     /// Set once the heatmap's history walk has been requested.
     history_loaded: bool,
+    /// What the worker is busy with, shown in the status bar so a slow first
+    /// load on a large repository reads as progress rather than a hang.
+    pending: Option<&'static str>,
 
     pub view: View,
     pub split: Split,
@@ -194,6 +205,7 @@ impl App {
             commit_diff: None,
             detail_seq: 0,
             history_loaded: false,
+            pending: None,
             view: View::Status,
             split: Split::Auto,
             modal: Modal::None,
@@ -246,10 +258,16 @@ impl App {
             }
         });
 
-        // Drain whatever else piled up while we were waiting.
+        // Drain what has already piled up, then return so a frame can be
+        // drawn. Deliberately a bounded pass rather than a sleep-and-rescan
+        // loop: a mouse producing motion faster than the coalescing window can
+        // feed such a loop forever, and the UI then never draws at all. That is
+        // a livelock, not a slow repository, and it presents as a total freeze.
+        let deadline = Instant::now() + COALESCE;
         loop {
             let mut progressed = false;
-            while let Ok(e) = events.try_recv() {
+            for _ in 0..DRAIN_MAX {
+                let Ok(e) = events.try_recv() else { break };
                 progressed = true;
                 got_anything = true;
                 if let Event::Mouse(m) = &e
@@ -259,17 +277,22 @@ impl App {
                     continue;
                 }
                 self.on_event(e);
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
-            while let Ok(m) = msgs.try_recv() {
+            for _ in 0..DRAIN_MAX {
+                let Ok(m) = msgs.try_recv() else { break };
                 progressed = true;
                 got_anything = true;
                 self.on_message(m);
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
-            if !progressed {
+            if !progressed || Instant::now() >= deadline {
                 break;
             }
-            // Small coalescing window so a burst becomes one frame.
-            std::thread::sleep(COALESCE);
         }
 
         if let Some(m) = latest_motion {
@@ -342,8 +365,10 @@ impl App {
                     .collect();
                 self.data.churn = entries.into_iter().map(|(p, _, n)| (p, n)).collect();
                 self.history_loaded = true;
+                self.pending = None;
             }
             Message::Log(commits) => {
+                self.pending = None;
                 self.log = commits;
                 self.log_sel = 0;
                 self.log_top = 0;
@@ -615,6 +640,11 @@ impl App {
         });
     }
 
+    /// Public wrapper so integration tests can drive a view switch.
+    pub fn apply_view_change(&mut self) {
+        self.on_view_changed()
+    }
+
     /// React to a view switch: the log needs its data fetched the first time.
     fn on_view_changed(&mut self) {
         self.diff_scroll = 0;
@@ -630,6 +660,7 @@ impl App {
             if self.log.is_empty() {
                 // Lazily loaded: a repo the user never opens the log on should
                 // not pay for the walk.
+                self.pending = Some("loading commits…");
                 let _ = self.tx.send(Request::Log { limit: LOG_LIMIT });
             } else {
                 self.request_commit_detail();
@@ -1209,6 +1240,13 @@ impl App {
             format!("  ✓{staged} ~{unstaged} +{untracked}  ",),
         ));
 
+        if let Some(p) = self.pending {
+            spans.push(Span::styled(
+                format!("{p}  "),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
         if !self.message.is_empty() {
             spans.push(Span::styled(
                 format!("{}  ", self.message),
@@ -1563,6 +1601,81 @@ mod tests {
                 subject: format!("commit {i}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn pump_returns_promptly_under_a_motion_flood() {
+        // Regression: the drain loop used to sleep and rescan while any event
+        // had arrived, so a mouse producing motion faster than the coalescing
+        // window kept it fed forever and no frame was ever drawn. On a large
+        // repository that presented as the whole UI freezing.
+        let (mut a, _rx) = app();
+        let (ev_tx, ev_rx) = mpsc::channel::<Event>();
+        let (_m_tx, m_rx) = mpsc::channel::<Message>();
+
+        let producer = std::thread::spawn(move || {
+            for i in 0..5_000u32 {
+                let e = Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: (i % 80) as u16,
+                    row: (i % 20) as u16,
+                    modifiers: KeyModifiers::NONE,
+                });
+                if ev_tx.send(e).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        let t = Instant::now();
+        a.pump(&ev_rx, &m_rx).unwrap();
+        let took = t.elapsed();
+        drop(m_rx);
+        drop(ev_rx);
+        let _ = producer.join();
+
+        assert!(
+            took < Duration::from_millis(500),
+            "pump took {took:?}; the UI cannot draw while it is inside pump"
+        );
+    }
+
+    #[test]
+    fn status_refresh_is_not_quadratic_in_tree_size() {
+        // Regression: merging untracked and newly-added paths did a linear
+        // `find` per path over every node, so a repository with tens of
+        // thousands of files and thousands of staged additions spent minutes
+        // inside a single status message.
+        let (mut a, _rx) = app();
+        let files: Vec<(PathBuf, u64)> = (0..20_000)
+            .map(|i| (PathBuf::from(format!("src/d{}/f{i}.rs", i % 100)), 100))
+            .collect();
+        a.tree = Tree::build(&files, Scale::Linear);
+
+        let status: Vec<FileStatus> = (0..4_000)
+            .map(|i| FileStatus {
+                path: PathBuf::from(format!("new/d{}/n{i}.rs", i % 50)),
+                staged: Change::Added,
+                unstaged: Change::None,
+            })
+            .collect();
+
+        let t = Instant::now();
+        a.on_message(Message::Status {
+            files: status,
+            head: HeadInfo {
+                branch: Some("main".into()),
+                oid: None,
+                state: crate::git::RepoState::Clean,
+            },
+        });
+        let took = t.elapsed();
+        assert!(
+            took < Duration::from_secs(2),
+            "status refresh took {took:?} on a 20k-file tree"
+        );
     }
 
     #[test]
