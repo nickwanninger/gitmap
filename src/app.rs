@@ -77,12 +77,13 @@ pub enum Split {
 pub enum View {
     Status,
     Heatmap,
+    Churn,
     Log,
 }
 
 impl View {
     /// Every view, in tab-bar and cycle order.
-    pub const ALL: [View; 3] = [View::Status, View::Heatmap, View::Log];
+    pub const ALL: [View; 4] = [View::Status, View::Heatmap, View::Churn, View::Log];
 
     /// Cycle order for `Tab`.
     fn next(self) -> View {
@@ -90,13 +91,25 @@ impl View {
         Self::ALL[(i + 1) % Self::ALL.len()]
     }
 
+    /// Cycle order for `Shift+Tab`.
+    fn prev(self) -> View {
+        let i = Self::ALL.iter().position(|&v| v == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
     /// Short name for the tab bar.
     pub fn label(self) -> &'static str {
         match self {
             View::Status => "changes",
             View::Heatmap => "age",
+            View::Churn => "churn",
             View::Log => "history",
         }
+    }
+
+    /// Whether the view needs the history walk's age and churn data.
+    pub fn needs_history(self) -> bool {
+        matches!(self, View::Heatmap | View::Churn)
     }
 
     /// One line saying what the view is for, shown under the tabs.
@@ -104,6 +117,7 @@ impl View {
         match self {
             View::Status => "what you have changed since HEAD",
             View::Heatmap => "how recently each file was last committed",
+            View::Churn => "how many commits have touched each file",
             View::Log => "commits, and which files each one touched",
         }
     }
@@ -153,6 +167,11 @@ pub struct App {
     detail_seq: u64,
     /// Set once the heatmap's history walk has been requested.
     history_loaded: bool,
+    /// Index into the churn ranking of the selected file, for j/k.
+    churn_sel: usize,
+    /// First visible row of the churn list, so the selection can scroll
+    /// without the list jumping under it.
+    churn_top: usize,
     /// What the worker is busy with, shown in the status bar so a slow first
     /// load on a large repository reads as progress rather than a hang.
     pending: Option<&'static str>,
@@ -205,6 +224,8 @@ impl App {
             commit_diff: None,
             detail_seq: 0,
             history_loaded: false,
+            churn_sel: 0,
+            churn_top: 0,
             pending: None,
             view: View::Status,
             split: Split::Auto,
@@ -502,7 +523,7 @@ impl App {
             }
             KeyCode::Char('?') => self.modal = Modal::Help,
             // Jump straight to a view; the digits match the tab bar.
-            KeyCode::Char(c @ '1'..='3') => {
+            KeyCode::Char(c @ '1'..='9') => {
                 let i = c as usize - '1' as usize;
                 if let Some(&v) = View::ALL.get(i)
                     && v != self.view
@@ -530,7 +551,7 @@ impl App {
             }
             KeyCode::BackTab => {
                 // Shift+Tab walks the cycle backwards.
-                self.view = self.view.next().next();
+                self.view = self.view.prev();
                 self.on_view_changed();
             }
             KeyCode::Char('|') => self.split = Split::Vertical,
@@ -548,6 +569,8 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.view == View::Log {
                     self.step_commit(1);
+                } else if self.view == View::Churn {
+                    self.step_churn(1);
                 } else {
                     self.diff_scroll = self.diff_scroll.saturating_add(1);
                 }
@@ -555,6 +578,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 if self.view == View::Log {
                     self.step_commit(-1);
+                } else if self.view == View::Churn {
+                    self.step_churn(-1);
                 } else {
                     self.diff_scroll = self.diff_scroll.saturating_sub(1);
                 }
@@ -606,6 +631,11 @@ impl App {
         if id != self.hovered {
             self.hovered = id;
             self.dirty = true;
+            // Hovering a block moves the churn list to the matching row, so the
+            // two halves of the view never disagree about what is selected.
+            if self.view == View::Churn && self.pinned.is_none() {
+                self.sync_churn_sel();
+            }
             // The highlight redraws on this frame; the diff waits for stillness.
             if self.pinned.is_none() {
                 self.pending_hover = Some(Instant::now());
@@ -656,13 +686,19 @@ impl App {
     /// React to a view switch: the log needs its data fetched the first time.
     fn on_view_changed(&mut self) {
         self.diff_scroll = 0;
-        if self.view == View::Heatmap && !self.history_loaded {
+        if self.view.needs_history() && !self.history_loaded {
             // Lazily loaded, like the log: a session that never opens the
             // heatmap should not pay for the walk.
             self.history_loaded = true;
             let _ = self.tx.send(Request::History {
                 limit: HISTORY_LIMIT,
             });
+        }
+        // Entering churn, start the selection from whatever the map is already
+        // pointing at, so switching tabs does not throw away the file the user
+        // had found in another view.
+        if self.view == View::Churn {
+            self.sync_churn_sel();
         }
         if self.view == View::Log {
             if self.log.is_empty() {
@@ -804,6 +840,58 @@ impl App {
         self.request_diff();
     }
 
+    /// Files the history walk saw change, most-changed first.
+    ///
+    /// One order shared by the list and by `j` / `k`, so the selection a
+    /// keypress moves is the line the user is looking at. Ties break on path
+    /// so the order is stable between frames rather than following the hash
+    /// map's iteration order.
+    fn churn_ranking(&self) -> Vec<(PathBuf, u32)> {
+        let mut v: Vec<(PathBuf, u32)> = self
+            .data
+            .churn
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(p, &n)| (p.clone(), n))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Point the churn selection at the currently targeted file, if that file
+    /// appears in the ranking at all. Leaves the selection alone when it does
+    /// not, so an untracked hover does not reset the list to the top.
+    fn sync_churn_sel(&mut self) {
+        let Some(id) = self.target() else { return };
+        let path = self.tree.node(id).path.clone();
+        if let Some(i) = self.churn_ranking().iter().position(|(p, _)| *p == path) {
+            self.churn_sel = i;
+        }
+    }
+
+    /// Move the churn selection, and point the map at the same file.
+    ///
+    /// Setting `pinned` as well as `hovered` is what keeps the highlight where
+    /// the keyboard put it: a stray mouse motion would otherwise drag the map's
+    /// highlight off the row the list still shows as selected.
+    fn step_churn(&mut self, delta: i32) {
+        let ranked = self.churn_ranking();
+        if ranked.is_empty() {
+            self.message = "no history yet".into();
+            return;
+        }
+        let n = ranked.len() as i32;
+        let i = (((self.churn_sel as i32 + delta) % n) + n) % n;
+        self.churn_sel = i as usize;
+        // A ranked file may be missing from the tree — deleted since, or
+        // outside the current HEAD listing. The row still selects; there is
+        // just nothing on the map to point at.
+        let id = self.tree.find(&ranked[self.churn_sel].0);
+        self.hovered = id;
+        self.pinned = id;
+        self.dirty = true;
+    }
+
     fn find(&mut self, query: &str) {
         if query.is_empty() {
             return;
@@ -878,6 +966,9 @@ impl App {
             }),
             View::Heatmap => Box::new(map::HeatColorizer {
                 palette: StatusPalette::default(),
+            }),
+            View::Churn => Box::new(map::ChurnColorizer {
+                max: self.data.churn.values().copied().max().unwrap_or(0),
             }),
             View::Log => Box::new(map::LogColorizer {
                 palette: StatusPalette::default(),
@@ -982,6 +1073,13 @@ impl App {
             return;
         }
 
+        // Same argument for churn: the view's claim is a commit count, and the
+        // ranking is the part a colour ramp cannot tell you.
+        if self.view == View::Churn {
+            self.draw_churn_pane(f, inner);
+            return;
+        }
+
         let lines = match (&self.diff, self.target()) {
             (Some((path, d)), _) => diffpane::lines(d, &path.display().to_string()),
             (None, Some(id)) => {
@@ -1046,6 +1144,102 @@ impl App {
             ))),
         }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    /// The churn pane: the selected file's commit count, then the files the
+    /// walk saw change most. The ranking is the part the map cannot show —
+    /// the busiest files are often small, so they are easy to miss as blocks.
+    fn draw_churn_pane(&mut self, f: &mut Frame, area: Rect) {
+        let ranked = self.churn_ranking();
+        if ranked.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "walking history…",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                area,
+            );
+            return;
+        }
+
+        let mut head = Vec::new();
+        if let Some(id) = self.target() {
+            let path = self.tree.node(id).path.clone();
+            head.push(Line::from(Span::styled(
+                path.display().to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            let n = self.data.churn.get(&path).copied().unwrap_or(0);
+            head.push(Line::from(match n {
+                0 => "no commits touch this file".to_string(),
+                1 => "1 commit".to_string(),
+                n => format!("{n} commits"),
+            }));
+            head.push(Line::from(""));
+        }
+        head.push(Line::from(Span::styled(
+            "most changed · j / k to walk",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+
+        // Scroll only as far as it takes to keep the selection on screen, so
+        // the list holds still while the cursor moves inside it.
+        let rows = area.height.saturating_sub(head.len() as u16) as usize;
+        self.churn_sel = self.churn_sel.min(ranked.len() - 1);
+        if rows > 0 {
+            if self.churn_sel < self.churn_top {
+                self.churn_top = self.churn_sel;
+            } else if self.churn_sel >= self.churn_top + rows {
+                self.churn_top = self.churn_sel + 1 - rows;
+            }
+        }
+        let top = self.churn_top.min(ranked.len().saturating_sub(1));
+
+        let max = ranked[0].1.max(1);
+        let hovered = self.target().map(|id| self.tree.node(id).path.clone());
+        let width = ranked
+            .iter()
+            .skip(top)
+            .take(rows)
+            .map(|e| e.1.to_string().len())
+            .max()
+            .unwrap_or(1);
+
+        let mut lines = head;
+        for (i, (path, n)) in ranked.iter().enumerate().skip(top).take(rows) {
+            // Highlight the row the map is pointing at, however it got there:
+            // a mouse hover over a block lights up its line in the list too.
+            let selected = i == self.churn_sel || hovered.as_deref() == Some(path.as_path());
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            // Tint the count by the same ramp the map uses, so a line in the
+            // list and its block on the map are recognisably the same value.
+            let c = palette::sample(
+                &palette::CONTRIB_GREEN[1..],
+                (*n as f32).ln_1p() / (max as f32).ln_1p(),
+            );
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{n:>width$} "),
+                    if selected {
+                        style
+                    } else {
+                        Style::default().fg(Color::Rgb(c.0, c.1, c.2))
+                    },
+                ),
+                Span::styled(path.display().to_string(), style),
+            ]));
+        }
+
+        f.render_widget(Paragraph::new(lines), area);
     }
 
     /// Draw the view tabs, so every view is visible rather than being a name
@@ -1273,6 +1467,14 @@ impl App {
                     ),
                     None => "j/k commit · Tab view · ? help".into(),
                 }
+            } else if self.view == View::Churn {
+                match self.target() {
+                    Some(id) => format!(
+                        "{}  j/k file · Tab view",
+                        self.tree.node(id).path.display()
+                    ),
+                    None => "j/k file · Tab view · ? help".into(),
+                }
             } else {
                 match self.target() {
                     Some(id) => self.tree.node(id).path.display().to_string(),
@@ -1429,11 +1631,11 @@ a            stage everything under the hovered directory
 c            commit prompt
 n / p        next / previous changed file
 /            find a file by name
-j / k        scroll the diff, or move the log selection
+j / k        scroll the diff, or move the log / churn selection
 Ctrl+D / U   scroll the commit diff in the log view
-Tab          cycle view: changes → age → history
+Tab          cycle view: changes → age → churn → history
 Shift+Tab    cycle the other way
-1 / 2 / 3    jump straight to a view (or click its tab)
+1 … 4        jump straight to a view (or click its tab)
 | / -        force vertical / horizontal split
 y            show the hovered path, or the commit SHA in the log view
 u            undo the last staging action
@@ -1480,6 +1682,7 @@ fn crossbeam_select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::TreeEntry;
     use std::path::Path;
     use std::sync::mpsc;
 
@@ -1816,8 +2019,10 @@ mod tests {
     #[test]
     fn digits_jump_straight_to_a_view() {
         let (mut a, _rx) = app();
-        a.on_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
         assert_eq!(a.view, View::Log);
+        a.on_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(a.view, View::Churn);
         a.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert_eq!(a.view, View::Status);
         a.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
@@ -1854,6 +2059,106 @@ mod tests {
         assert!(a.data.age[Path::new("b.rs")] > a.data.age[Path::new("a.rs")]);
     }
 
+    /// A tree plus a history walk, which is what the churn view needs before
+    /// any of its navigation means anything.
+    fn churn_app() -> (App, mpsc::Receiver<Request>) {
+        let (mut a, rx) = app();
+        a.on_message(Message::Tree(vec![
+            TreeEntry {
+                path: PathBuf::from("busy.rs"),
+                size: 100,
+                loc: None,
+            },
+            TreeEntry {
+                path: PathBuf::from("mid.rs"),
+                size: 100,
+                loc: None,
+            },
+            TreeEntry {
+                path: PathBuf::from("quiet.rs"),
+                size: 100,
+                loc: None,
+            },
+        ]));
+        a.on_message(Message::History(vec![
+            (PathBuf::from("busy.rs"), 1_700_000_000, 9),
+            (PathBuf::from("mid.rs"), 1_700_000_000, 5),
+            (PathBuf::from("quiet.rs"), 1_700_000_000, 1),
+        ]));
+        a.view = View::Churn;
+        (a, rx)
+    }
+
+    #[test]
+    fn churn_ranking_is_most_changed_first() {
+        let (a, _rx) = churn_app();
+        let r = a.churn_ranking();
+        let names: Vec<String> = r.iter().map(|(p, _)| p.display().to_string()).collect();
+        assert_eq!(names, ["busy.rs", "mid.rs", "quiet.rs"]);
+    }
+
+    #[test]
+    fn jk_walks_the_churn_list_and_moves_the_map_highlight() {
+        let (mut a, _rx) = churn_app();
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.churn_sel, 1);
+        // The map must point at the same file the list selected, or the two
+        // halves of the view disagree.
+        let t = a.target().expect("stepping should target a file");
+        assert_eq!(a.tree.node(t).path, PathBuf::from("mid.rs"));
+
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(a.churn_sel, 2);
+        let t = a.target().unwrap();
+        assert_eq!(a.tree.node(t).path, PathBuf::from("quiet.rs"));
+
+        a.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(a.churn_sel, 1);
+        a.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(a.churn_sel, 0);
+        let t = a.target().unwrap();
+        assert_eq!(a.tree.node(t).path, PathBuf::from("busy.rs"));
+    }
+
+    #[test]
+    fn churn_selection_wraps_at_both_ends() {
+        let (mut a, _rx) = churn_app();
+        a.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(a.churn_sel, 2, "k at the top should wrap to the bottom");
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.churn_sel, 0, "j at the bottom should wrap to the top");
+    }
+
+    #[test]
+    fn jk_does_not_scroll_the_diff_in_the_churn_view() {
+        let (mut a, _rx) = churn_app();
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.diff_scroll, 0, "j drives the list here, not the diff");
+    }
+
+    #[test]
+    fn entering_churn_keeps_the_file_the_map_was_on() {
+        let (mut a, _rx) = churn_app();
+        a.view = View::Status;
+        let id = a.tree.find(Path::new("quiet.rs")).unwrap();
+        a.pinned = Some(id);
+        a.view = View::Churn;
+        a.on_view_changed();
+        assert_eq!(
+            a.churn_sel, 2,
+            "switching to churn should land on the already-selected file"
+        );
+    }
+
+    #[test]
+    fn hovering_a_block_moves_the_churn_selection() {
+        let (mut a, _rx) = churn_app();
+        let id = a.tree.find(Path::new("mid.rs")).unwrap();
+        a.hovered = Some(id);
+        a.sync_churn_sel();
+        assert_eq!(a.churn_sel, 1);
+    }
+
     #[test]
     fn clicking_a_tab_switches_view() {
         let (mut a, _rx) = app();
@@ -1868,11 +2173,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_all_three_views() {
+    fn tab_cycles_all_views() {
         let (mut a, _rx) = app();
         assert_eq!(a.view, View::Status);
         a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(a.view, View::Heatmap);
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.view, View::Churn);
         a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(a.view, View::Log);
         a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -1884,6 +2191,8 @@ mod tests {
         let (mut a, _rx) = app();
         a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(a.view, View::Log);
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(a.view, View::Churn);
         a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(a.view, View::Heatmap);
     }

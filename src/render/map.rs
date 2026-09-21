@@ -175,6 +175,58 @@ impl Colorizer for HeatColorizer {
     }
 }
 
+/// Colour by how many commits touched the file, on the contribution greens.
+///
+/// A count, unlike an age, has no natural ceiling: one generated file with
+/// hundreds of commits would flatten everything else onto the empty step. So
+/// the ramp is normalised against the busiest file in the walk and log-scaled,
+/// which is what keeps the long tail of two- and three-commit files apart.
+pub struct ChurnColorizer {
+    /// Highest churn count in the current walk, or 0 when there is no history.
+    pub max: u32,
+}
+
+impl ChurnColorizer {
+    /// Map a commit count onto 0..1 against the busiest file.
+    fn t(count: u32, max: u32) -> f32 {
+        if count == 0 || max <= 1 {
+            return 0.0;
+        }
+        let c = (count as f32).ln_1p();
+        let m = (max as f32).ln_1p();
+        (c / m).clamp(0.0, 1.0)
+    }
+}
+
+impl Colorizer for ChurnColorizer {
+    fn color(&self, tree: &Tree, id: NodeId, data: &MapData) -> Rgb {
+        match data.churn.get(&tree.node(id).path) {
+            // The ramp's low end is the "no commits" tile, so a file with one
+            // commit must not land there: lift the floor off the empty step.
+            Some(&n) if n > 0 => {
+                let t = Self::t(n, self.max);
+                palette::sample(&palette::CONTRIB_GREEN[1..], t)
+            }
+            // Untracked, or older than the walk. Same cold neutral the age view
+            // uses for "the data does not say".
+            _ => palette::CONTRIB_GREEN[0],
+        }
+    }
+
+    fn legend(&self) -> Vec<(&'static str, Rgb)> {
+        vec![
+            ("none", palette::CONTRIB_GREEN[0]),
+            ("few", palette::CONTRIB_GREEN[1]),
+            ("", palette::CONTRIB_GREEN[3]),
+            ("many", palette::CONTRIB_GREEN[4]),
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "churn"
+    }
+}
+
 /// Colour by whether the selected commit touched the file.
 ///
 /// Touched files light up at full chroma on their own directory's hue; every
@@ -624,6 +676,31 @@ mod tests {
         assert!(
             (u - o).abs() > 0.02,
             "a file with no history ({u}) must not look like an ancient one ({o})"
+        );
+    }
+
+    #[test]
+    fn churn_colorizer_ranks_busy_above_quiet() {
+        let t = Tree::build(
+            &[
+                (PathBuf::from("busy.rs"), 100),
+                (PathBuf::from("quiet.rs"), 100),
+                (PathBuf::from("untouched.rs"), 100),
+            ],
+            Scale::Linear,
+        );
+        let mut d = MapData::new();
+        d.churn.insert(PathBuf::from("busy.rs"), 50);
+        d.churn.insert(PathBuf::from("quiet.rs"), 1);
+        let c = ChurnColorizer { max: 50 };
+        let l = |n: &str| {
+            palette::to_oklab(c.color(&t, t.find(std::path::Path::new(n)).unwrap(), &d)).l
+        };
+        let (b, q, u) = (l("busy.rs"), l("quiet.rs"), l("untouched.rs"));
+        assert!(b > q, "busy {b} should be brighter than quiet {q}");
+        assert!(
+            (q - u).abs() > 0.02,
+            "one commit ({q}) must not look like none ({u})"
         );
     }
 
