@@ -285,7 +285,13 @@ fn visual() {
         Ok(p) => (PathBuf::from(p), false),
         Err(_) => (fixture("visual"), true),
     };
-    let (app, term) = render(&dir, 100, 30);
+    // GITMAP_VISUAL_W widens the frame, which is how the diff pane's column
+    // cap becomes visible.
+    let w: u16 = std::env::var("GITMAP_VISUAL_W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let (app, term) = render(&dir, w, 30);
 
     let files: Vec<_> = app.tree.files_under(app.tree.root);
     for y in 0..app.hits.h {

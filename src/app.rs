@@ -36,6 +36,13 @@ const DIFF_DEBOUNCE: Duration = Duration::from_millis(80);
 /// Coalescing window: a burst of motion events produces one frame.
 const COALESCE: Duration = Duration::from_millis(8);
 
+/// Widest the diff pane may get when the panes sit side by side.
+///
+/// 80 columns of diff text plus the pane's two border columns. Beyond this a
+/// unified diff gains nothing but trailing whitespace, whereas the map turns
+/// every extra column into pixels.
+const DIFF_MAX_COLS: u16 = 82;
+
 /// Split direction. Diffs want width, maps want square.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Split {
@@ -671,16 +678,26 @@ impl App {
             Split::Horizontal => false,
             Split::Auto => body.width as f32 >= 2.2 * body.height as f32,
         };
-        let dir = if vertical {
-            Direction::Horizontal
+        if vertical {
+            // Side by side. The diff takes half, but never more than
+            // DIFF_MAX_COLS: past roughly 80 columns a unified diff just grows
+            // whitespace, while the map can always use the pixels. On a wide
+            // terminal the surplus therefore goes to the map.
+            let diff_w = (body.width / 2).min(DIFF_MAX_COLS);
+            let parts = TuiLayout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(diff_w)])
+                .split(body);
+            (parts[0], parts[1], status)
         } else {
-            Direction::Vertical
-        };
-        let parts = TuiLayout::default()
-            .direction(dir)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(body);
-        (parts[0], parts[1], status)
+            // Stacked. Width is shared by both panes, so there is nothing to
+            // cap; the split is by height.
+            let parts = TuiLayout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(body);
+            (parts[0], parts[1], status)
+        }
     }
 
     fn draw_side(&self, f: &mut Frame, area: Rect) {
@@ -1064,6 +1081,62 @@ mod tests {
         // Tall terminal: stacked.
         let (m, s, _) = a.split_areas(Rect::new(0, 0, 80, 60));
         assert!(m.y < s.y, "tall should split horizontally");
+    }
+
+    #[test]
+    fn diff_pane_is_capped_side_by_side() {
+        let (a, _rx) = app();
+        // Very wide terminal: half would be 150 columns, so the cap bites and
+        // the surplus goes to the map.
+        let (m, d, _) = a.split_areas(Rect::new(0, 0, 300, 60));
+        assert_eq!(d.width, DIFF_MAX_COLS);
+        assert_eq!(m.width + d.width, 300, "panes must still tile the row");
+        assert!(m.width > d.width, "the map should get the surplus");
+    }
+
+    #[test]
+    fn diff_pane_takes_half_when_under_the_cap() {
+        let (a, _rx) = app();
+        // 120 columns: half is 60, under the cap, so nothing is clamped.
+        let (m, d, _) = a.split_areas(Rect::new(0, 0, 120, 40));
+        assert_eq!(d.width, 60);
+        assert_eq!(m.width, 60);
+    }
+
+    #[test]
+    fn cap_leaves_the_diff_usable_at_exactly_the_threshold() {
+        let (a, _rx) = app();
+        // Half of 164 is exactly the cap; no rounding surprises either side.
+        let (_, d, _) = a.split_areas(Rect::new(0, 0, 164, 40));
+        assert_eq!(d.width, DIFF_MAX_COLS);
+        let (_, d, _) = a.split_areas(Rect::new(0, 0, 162, 40));
+        assert_eq!(d.width, 81);
+    }
+
+    #[test]
+    fn stacked_split_is_not_capped() {
+        // Stacked panes share the full width, so the cap does not apply — it
+        // would only shrink the diff for no reason.
+        let (mut a, _rx) = app();
+        a.split = Split::Horizontal;
+        let (m, d, _) = a.split_areas(Rect::new(0, 0, 300, 60));
+        assert_eq!(d.width, 300);
+        assert_eq!(m.width, 300);
+        assert!(m.y < d.y);
+    }
+
+    #[test]
+    fn narrow_terminal_still_gives_the_map_room() {
+        // The cap must never starve the map on a small terminal. Forced
+        // side-by-side, because Auto would stack these and the column split
+        // would not apply at all.
+        for w in [20u16, 40, 60, 80] {
+            let (mut a, _rx) = app();
+            a.split = Split::Vertical;
+            let (m, d, _) = a.split_areas(Rect::new(0, 0, w, 30));
+            assert!(m.width >= 1, "map vanished at width {w}");
+            assert_eq!(m.width + d.width, w, "panes do not tile at width {w}");
+        }
     }
 
     #[test]
