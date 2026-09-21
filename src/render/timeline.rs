@@ -121,18 +121,26 @@ fn bucket(counts: &[usize], n: usize) -> Vec<usize> {
 ///
 /// Returns the per-day counts and the day index of each commit, so the caller
 /// can mark where the selection sits without re-deriving the bucketing.
-pub fn commits_per_day(times_newest_first: &[i64]) -> (Vec<usize>, Vec<usize>) {
-    if times_newest_first.is_empty() {
+///
+/// The range comes from the actual minimum and maximum rather than from the
+/// ends of the slice. `git log` walks the commit graph in topological order,
+/// not date order, so on any repository with merges or rebases the timestamps
+/// are not monotonic — llama.cpp's most recent 200 commits swing back and forth
+/// across four months. Trusting the ends there understated the span by a factor
+/// of five and clamped a tenth of the commits onto the first day, which both
+/// distorted the strip and made the selection marker jump around.
+pub fn commits_per_day(times: &[i64]) -> (Vec<usize>, Vec<usize>) {
+    if times.is_empty() {
         return (Vec::new(), Vec::new());
     }
     const DAY: i64 = 86_400;
-    let oldest = *times_newest_first.last().unwrap();
-    let newest = times_newest_first[0];
+    let oldest = *times.iter().min().unwrap();
+    let newest = *times.iter().max().unwrap();
     let days = (((newest - oldest) / DAY) + 1).clamp(1, 4096) as usize;
 
     let mut counts = vec![0usize; days];
-    let mut index = Vec::with_capacity(times_newest_first.len());
-    for &t in times_newest_first {
+    let mut index = Vec::with_capacity(times.len());
+    for &t in times {
         let d = (((t - oldest) / DAY).max(0) as usize).min(days - 1);
         counts[d] += 1;
         index.push(d);
@@ -267,6 +275,48 @@ mod tests {
         let (counts, index) = commits_per_day(&[1_700_000_000]);
         assert_eq!(counts, vec![1]);
         assert_eq!(index, vec![0]);
+    }
+
+    #[test]
+    fn commits_per_day_handles_non_monotonic_times() {
+        // Regression: `git log` walks topologically, not by date, so a repo
+        // with merges or rebases yields timestamps that swing back and forth.
+        // Taking the range from the ends of the slice understated the span and
+        // clamped the out-of-range commits onto day 0.
+        const DAY: i64 = 86_400;
+        let base = 1_700_000_000i64;
+        // Ends span 2 days, but one commit in the middle is 100 days older.
+        let times = vec![base + 2 * DAY, base - 100 * DAY, base];
+        let (counts, index) = commits_per_day(&times);
+
+        assert_eq!(counts.len(), 103, "span must cover the true minimum");
+        assert_eq!(counts.iter().sum::<usize>(), 3, "no commit may be lost");
+        // Each commit lands in its own day, none piled onto day 0.
+        assert_eq!(index[1], 0, "the true oldest anchors day 0");
+        assert_eq!(index[2], 100);
+        assert_eq!(index[0], 102);
+    }
+
+    #[test]
+    fn commits_per_day_places_every_commit_in_its_own_bucket() {
+        // Property: whatever the ordering, a commit's day index must reflect
+        // its own timestamp relative to the real minimum.
+        const DAY: i64 = 86_400;
+        let base = 1_700_000_000i64;
+        let times: Vec<i64> = [5i64, 0, 90, 12, 3, 60, 1]
+            .iter()
+            .map(|d| base + d * DAY)
+            .collect();
+        let (counts, index) = commits_per_day(&times);
+        let min = *times.iter().min().unwrap();
+        for (i, &t) in times.iter().enumerate() {
+            assert_eq!(
+                index[i],
+                ((t - min) / DAY) as usize,
+                "commit {i} landed in the wrong bucket"
+            );
+        }
+        assert_eq!(counts.iter().sum::<usize>(), times.len());
     }
 
     #[test]
