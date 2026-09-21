@@ -640,6 +640,14 @@ impl App {
         });
     }
 
+    /// Seconds since the epoch, for turning a commit time into an age.
+    fn now(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
     /// Public wrapper so integration tests can drive a view switch.
     pub fn apply_view_change(&mut self) {
         self.on_view_changed()
@@ -1126,16 +1134,20 @@ impl App {
             })
             .collect();
 
-        // Mark roughly where the selection sits along the strip.
-        let mut marker = " ".repeat(area.width as usize);
-        if let Some(&day) = day_of.get(self.log_sel)
-            && !counts.is_empty()
-            && area.width > 0
-        {
-            let col = day * area.width as usize / counts.len().max(1);
-            let col = col.min(area.width as usize - 1);
-            marker.replace_range(col..col + 1, "▲");
-        }
+        // Mark where the selection sits, labelled with how long ago it was.
+        let marker = match day_of.get(self.log_sel) {
+            Some(&day) if !counts.is_empty() && area.width > 0 => {
+                let col =
+                    (day * area.width as usize / counts.len().max(1)).min(area.width as usize - 1);
+                let label = self
+                    .log
+                    .get(self.log_sel)
+                    .map(|c| human_age(self.now().saturating_sub(c.time)))
+                    .unwrap_or_default();
+                marker_line(area.width as usize, col, &label)
+            }
+            _ => String::new(),
+        };
 
         f.render_widget(
             Paragraph::new(vec![
@@ -1347,6 +1359,46 @@ impl App {
         f.render_widget(block, rect);
         f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
     }
+}
+
+/// Lay out the timeline's selection marker: an arrow at `col`, with `label`
+/// beside it on whichever side has room.
+///
+/// The label prefers the right, because reading left-to-right that puts the
+/// arrow first and the text after it. It flips to the left when the right edge
+/// is too close, and is dropped entirely when neither side fits — an arrow with
+/// no label still says where the selection is, whereas a truncated label says
+/// nothing useful.
+fn marker_line(width: usize, col: usize, label: &str) -> String {
+    let mut line = vec![' '; width];
+    if width == 0 {
+        return String::new();
+    }
+    let col = col.min(width - 1);
+    line[col] = '▲';
+
+    if !label.is_empty() {
+        let n = label.chars().count();
+        // One space between the arrow and the text on either side.
+        let right_start = col + 2;
+        let fits_right = right_start + n <= width;
+        // On the left the label ends one cell before the arrow.
+        let fits_left = col >= n + 1;
+
+        let start = if fits_right {
+            Some(right_start)
+        } else if fits_left {
+            Some(col - 1 - n)
+        } else {
+            None
+        };
+        if let Some(start) = start {
+            for (i, ch) in label.chars().enumerate() {
+                line[start + i] = ch;
+            }
+        }
+    }
+    line.into_iter().collect()
 }
 
 /// Render a duration in seconds as the coarsest unit that still says
@@ -1676,6 +1728,62 @@ mod tests {
             took < Duration::from_secs(2),
             "status refresh took {took:?} on a 20k-file tree"
         );
+    }
+
+    #[test]
+    fn marker_puts_the_label_to_the_right_when_it_fits() {
+        let l = marker_line(30, 2, "3 days ago");
+        assert_eq!(l, "  ▲ 3 days ago                ");
+        assert_eq!(l.chars().count(), 30, "line must fill the width");
+    }
+
+    #[test]
+    fn marker_flips_the_label_left_near_the_right_edge() {
+        // At the far right there is no room after the arrow, so the label has
+        // to go before it rather than being cut off.
+        let l = marker_line(20, 18, "3 days ago");
+        assert_eq!(l, "       3 days ago ▲ ");
+        assert!(
+            l.contains("3 days ago"),
+            "label was dropped despite fitting"
+        );
+        assert_eq!(l.chars().count(), 20);
+    }
+
+    #[test]
+    fn marker_keeps_the_arrow_when_the_label_cannot_fit() {
+        // Narrow pane: an unlabelled arrow still says where the selection is,
+        // which beats a truncated label that says nothing.
+        let l = marker_line(8, 4, "11 months ago");
+        assert_eq!(l, "    ▲   ");
+        assert!(l.contains('▲'));
+    }
+
+    #[test]
+    fn marker_handles_the_extremes() {
+        // Column 0 and the last column must not panic or spill.
+        for (w, col) in [(1usize, 0usize), (10, 0), (10, 9), (40, 39)] {
+            let l = marker_line(w, col, "2 hours ago");
+            assert_eq!(l.chars().count(), w, "width {w} col {col}");
+            assert!(l.contains('▲'), "arrow lost at width {w} col {col}");
+        }
+        assert_eq!(marker_line(0, 0, "x"), "");
+        // An out-of-range column clamps rather than panicking.
+        let l = marker_line(5, 99, "x");
+        assert_eq!(l.chars().count(), 5);
+        assert!(l.ends_with('▲'));
+    }
+
+    #[test]
+    fn marker_label_never_overwrites_the_arrow() {
+        for col in 0..30usize {
+            let l = marker_line(30, col, "5 days ago");
+            assert_eq!(
+                l.chars().filter(|&c| c == '▲').count(),
+                1,
+                "arrow clobbered at col {col}: {l:?}"
+            );
+        }
     }
 
     #[test]
