@@ -145,6 +145,12 @@ pub struct App {
     pub layout: Layout,
     pub hits: HitBuffer,
     pub canvas: Canvas,
+    /// The map without the hover overlay, reused across hover frames.
+    base: Canvas,
+    /// What `base` was rendered for; a mismatch forces a re-render.
+    base_stamp: Option<(u64, View, (u16, u16), Scale, ColorDepth)>,
+    /// Bumped whenever anything the map's colours depend on changes.
+    data_rev: u64,
 
     pub status: HashMap<PathBuf, FileStatus>,
     pub head: Option<HeadInfo>,
@@ -180,6 +186,12 @@ pub struct App {
     spinner_at: Instant,
     /// Index into the churn ranking of the selected file, for j/k.
     churn_sel: usize,
+    /// Cached ranking, rebuilt when history arrives rather than per draw.
+    churn_rank: Vec<(PathBuf, u32)>,
+    /// Path to its position in `churn_rank`, so a hover is a lookup not a scan.
+    churn_at: HashMap<PathBuf, usize>,
+    /// Cached ramp saturation point.
+    churn_sat: u32,
     /// First visible row of the churn list, so the selection can scroll
     /// without the list jumping under it.
     churn_top: usize,
@@ -221,6 +233,9 @@ impl App {
             },
             hits: HitBuffer::empty(),
             canvas: Canvas::new(0, 0),
+            base: Canvas::new(0, 0),
+            base_stamp: None,
+            data_rev: 0,
             status: HashMap::new(),
             head: None,
             data: map::MapData::new(),
@@ -240,6 +255,9 @@ impl App {
             spinner: 0,
             spinner_at: Instant::now(),
             churn_sel: 0,
+            churn_rank: Vec::new(),
+            churn_at: HashMap::new(),
+            churn_sat: 0,
             churn_top: 0,
             pending: None,
             view: View::Status,
@@ -366,6 +384,11 @@ impl App {
 
     fn on_message(&mut self, m: Message) {
         self.dirty = true;
+        // Every worker message can change what the map shows — status, tree,
+        // history, commit selection. Bumping here rather than at each
+        // assignment means a new message kind cannot forget to invalidate the
+        // cached base and leave a stale map on screen.
+        self.data_rev = self.data_rev.wrapping_add(1);
         match m {
             Message::Status { files, head } => {
                 self.status = files.into_iter().map(|f| (f.path.clone(), f)).collect();
@@ -418,6 +441,9 @@ impl App {
                 self.data.churn = entries.into_iter().map(|(p, _, n)| (p, n)).collect();
                 self.history_walked = commits;
                 self.history_done = done;
+                // The ranking is derived data; rebuild it here, once per
+                // arriving chunk, rather than on every draw.
+                self.rebuild_churn_rank();
                 if done {
                     self.pending = None;
                 }
@@ -487,6 +513,7 @@ impl App {
         }
         self.tree = Tree::build(&pairs, self.scale);
         self.laid_out_for = (0, 0);
+        self.data_rev = self.data_rev.wrapping_add(1);
     }
 
     fn on_event(&mut self, e: Event) {
@@ -751,6 +778,7 @@ impl App {
             // Leaving the log clears its highlight so the status and heatmap
             // views are not tinted by a stale commit selection.
             self.data.commit_paths.clear();
+            self.data_rev = self.data_rev.wrapping_add(1);
         }
     }
 
@@ -884,7 +912,16 @@ impl App {
     /// keypress moves is the line the user is looking at. Ties break on path
     /// so the order is stable between frames rather than following the hash
     /// map's iteration order.
-    fn churn_ranking(&self) -> Vec<(PathBuf, u32)> {
+    fn churn_ranking(&self) -> &[(PathBuf, u32)] {
+        &self.churn_rank
+    }
+
+    /// Rebuild the cached ranking and its path index.
+    ///
+    /// Called when the history data changes, never from a draw. Cloning and
+    /// sorting 78k paths costs ~60ms on a large repository, which as per-frame
+    /// work made every keystroke in the churn view feel stuck.
+    fn rebuild_churn_rank(&mut self) {
         let mut v: Vec<(PathBuf, u32)> = self
             .data
             .churn
@@ -893,7 +930,14 @@ impl App {
             .map(|(p, &n)| (p.clone(), n))
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        v
+        self.churn_at = v
+            .iter()
+            .enumerate()
+            .map(|(i, (p, _))| (p.clone(), i))
+            .collect();
+        self.churn_rank = v;
+        let mut counts: Vec<u32> = self.data.churn.values().copied().collect();
+        self.churn_sat = map::ChurnColorizer::saturation_point(&mut counts);
     }
 
     /// Point the churn selection at the currently targeted file, if that file
@@ -901,8 +945,8 @@ impl App {
     /// not, so an untracked hover does not reset the list to the top.
     fn sync_churn_sel(&mut self) {
         let Some(id) = self.target() else { return };
-        let path = self.tree.node(id).path.clone();
-        if let Some(i) = self.churn_ranking().iter().position(|(p, _)| *p == path) {
+        // Indexed rather than scanned: this runs on every hover.
+        if let Some(&i) = self.churn_at.get(&self.tree.node(id).path) {
             self.churn_sel = i;
         }
     }
@@ -931,10 +975,10 @@ impl App {
         self.history_loaded && !self.history_done
     }
 
-    /// Where the churn ramp saturates for the current walk.
+    /// Where the churn ramp saturates for the current walk. Cached alongside
+    /// the ranking; see `rebuild_churn_rank`.
     fn churn_saturation(&self) -> u32 {
-        let mut counts: Vec<u32> = self.data.churn.values().copied().collect();
-        map::ChurnColorizer::saturation_point(&mut counts)
+        self.churn_sat
     }
 
     /// Move the churn selection, and point the map at the same file.
@@ -943,18 +987,19 @@ impl App {
     /// the keyboard put it: a stray mouse motion would otherwise drag the map's
     /// highlight off the row the list still shows as selected.
     fn step_churn(&mut self, delta: i32) {
-        let ranked = self.churn_ranking();
-        if ranked.is_empty() {
+        let len = self.churn_rank.len();
+        if len == 0 {
             self.message = "no history yet".into();
             return;
         }
-        let n = ranked.len() as i32;
+        let n = len as i32;
         let i = (((self.churn_sel as i32 + delta) % n) + n) % n;
         self.churn_sel = i as usize;
         // A ranked file may be missing from the tree — deleted since, or
         // outside the current HEAD listing. The row still selects; there is
         // just nothing on the map to point at.
-        let id = self.tree.find(&ranked[self.churn_sel].0);
+        let path = self.churn_rank[self.churn_sel].0.clone();
+        let id = self.tree.find(&path);
         self.hovered = id;
         self.pinned = id;
         self.dirty = true;
@@ -1045,17 +1090,40 @@ impl App {
 
         // Move the canvas out so the draw call can borrow the rest of `self`
         // immutably, then put it back.
-        let mut canvas = std::mem::replace(&mut self.canvas, Canvas::new(0, 0));
-        map::draw(
-            &mut canvas,
-            &self.tree,
-            &self.layout,
-            &self.data,
-            &*colorizer,
-            &self.palette,
+        // The base map is expensive — a colour per leaf — but depends only on
+        // the tree, layout, data and view, none of which a hover changes. Render
+        // it when one of those moves, then reuse the pixels: a hover frame
+        // becomes a memcpy plus a few overlay rectangles.
+        let stamp = (
+            self.data_rev,
+            self.view,
+            self.laid_out_for,
+            self.scale,
             self.depth,
-            self.target(),
         );
+        if self.base_stamp != Some(stamp) {
+            let mut base = std::mem::replace(&mut self.base, Canvas::new(0, 0));
+            if base.w != self.canvas.w || base.h != self.canvas.h {
+                base = Canvas::new(self.canvas.w, self.canvas.h);
+            }
+            map::draw_base(
+                &mut base,
+                &self.tree,
+                &self.layout,
+                &self.data,
+                &*colorizer,
+                &self.palette,
+                self.depth,
+            );
+            self.base = base;
+            self.base_stamp = Some(stamp);
+        }
+
+        let mut canvas = std::mem::replace(&mut self.canvas, Canvas::new(0, 0));
+        canvas.px.copy_from_slice(&self.base.px);
+        if let Some(h) = self.target() {
+            map::draw_hover(&mut canvas, &self.tree, &self.layout, self.depth, h);
+        }
         canvas.blit(f.buffer_mut(), map_area);
         self.canvas = canvas;
 
@@ -1301,15 +1369,22 @@ impl App {
         // Scroll only as far as it takes to keep the selection on screen, so
         // the list holds still while the cursor moves inside it.
         let rows = area.height.saturating_sub(head.len() as u16) as usize;
-        self.churn_sel = self.churn_sel.min(ranked.len() - 1);
-        if rows > 0 {
-            if self.churn_sel < self.churn_top {
-                self.churn_top = self.churn_sel;
-            } else if self.churn_sel >= self.churn_top + rows {
-                self.churn_top = self.churn_sel + 1 - rows;
+        let (sel, top) = {
+            let len = self.churn_rank.len();
+            let sel = self.churn_sel.min(len - 1);
+            let mut top = self.churn_top;
+            if rows > 0 {
+                if sel < top {
+                    top = sel;
+                } else if sel >= top + rows {
+                    top = sel + 1 - rows;
+                }
             }
-        }
-        let top = self.churn_top.min(ranked.len().saturating_sub(1));
+            (sel, top.min(len.saturating_sub(1)))
+        };
+        self.churn_sel = sel;
+        self.churn_top = top;
+        let ranked = self.churn_ranking();
 
         let ramp = map::ChurnColorizer {
             max: self.churn_saturation(),
@@ -1327,7 +1402,7 @@ impl App {
         for (i, (path, n)) in ranked.iter().enumerate().skip(top).take(rows) {
             // Highlight the row the map is pointing at, however it got there:
             // a mouse hover over a block lights up its line in the list too.
-            let selected = i == self.churn_sel || hovered.as_deref() == Some(path.as_path());
+            let selected = i == sel || hovered.as_deref() == Some(path.as_path());
             let style = if selected {
                 Style::default()
                     .fg(Color::Black)
@@ -2279,6 +2354,79 @@ mod tests {
         a.hovered = Some(id);
         a.sync_churn_sel();
         assert_eq!(a.churn_sel, 1);
+    }
+
+    #[test]
+    fn the_map_cache_invalidates_when_the_view_changes() {
+        // The base canvas is cached across hover frames. If the stamp misses a
+        // dependency the map goes stale, which is worse than being slow.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (mut a, _rx) = churn_app();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+        a.view = View::Status;
+        term.draw(|f| a.draw(f)).unwrap();
+        let status_px = a.base.px.clone();
+
+        a.view = View::Churn;
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_ne!(
+            a.base.px, status_px,
+            "switching view must re-render the cached base"
+        );
+    }
+
+    #[test]
+    fn the_map_cache_invalidates_when_history_arrives() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (mut a, _rx) = app();
+        a.on_message(Message::Tree(vec![
+            TreeEntry {
+                path: PathBuf::from("a.rs"),
+                size: 100,
+                loc: None,
+            },
+            TreeEntry {
+                path: PathBuf::from("b.rs"),
+                size: 100,
+                loc: None,
+            },
+        ]));
+        a.view = View::Churn;
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let before = a.base.px.clone();
+
+        a.on_message(Message::History {
+            entries: vec![
+                (PathBuf::from("a.rs"), 1_700_000_000, 9),
+                (PathBuf::from("b.rs"), 1_700_000_000, 1),
+            ],
+            commits: 9,
+            done: true,
+        });
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_ne!(
+            a.base.px, before,
+            "new history must repaint the map, not reuse the cached base"
+        );
+    }
+
+    #[test]
+    fn hovering_does_not_re_render_the_cached_base() {
+        // The point of the cache: a hover frame must not repaint the base.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (mut a, _rx) = churn_app();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let stamp = a.base_stamp;
+
+        a.hovered = a.tree.find(Path::new("mid.rs"));
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.base_stamp, stamp, "a hover must reuse the cached base");
     }
 
     #[test]

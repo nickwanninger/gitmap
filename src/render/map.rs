@@ -314,10 +314,39 @@ pub fn draw(
     depth: ColorDepth,
     hovered: Option<NodeId>,
 ) {
+    draw_base(canvas, tree, layout, data, colorizer, palette, depth);
+    if let Some(h) = hovered {
+        draw_hover(canvas, tree, layout, depth, h);
+    }
+}
+
+/// The map without any hover overlay.
+///
+/// Split out because this is the expensive half — a colour per leaf, with hash,
+/// oklab and hue-shift work for each — while the hover overlay is a handful of
+/// rectangles. The base depends only on the tree, layout, data and view, none
+/// of which change when the mouse moves, so the caller can render it once and
+/// reuse the pixels across hover frames.
+pub fn draw_base(
+    canvas: &mut Canvas,
+    tree: &Tree,
+    layout: &Layout,
+    data: &MapData,
+    colorizer: &dyn Colorizer,
+    palette: &StatusPalette,
+    depth: ColorDepth,
+) {
     canvas.clear(depth.quantize(palette.background));
 
     // Directory tints, shallowest first so deeper ones paint over.
-    let mut dirs: Vec<NodeId> = (0..tree.len()).filter(|&i| tree.node(i).is_dir).collect();
+    //
+    // Only collapsed directories actually show: since children tile their
+    // parent exactly, an expanded directory's tint is completely overdrawn by
+    // the files loop below. Skipping the rest avoids a full sort of every
+    // directory on every frame — 45k nodes on a large repository.
+    let mut dirs: Vec<NodeId> = (0..tree.len())
+        .filter(|&i| tree.node(i).is_dir && layout.collapsed[i] && layout.rects[i].is_some())
+        .collect();
     dirs.sort_by_key(|&i| tree.node(i).depth);
     for id in dirs {
         let Some(r) = layout.rects[id] else { continue };
@@ -371,9 +400,6 @@ pub fn draw(
         canvas.fill_rect(r, depth.quantize(palette::jitter(c, n * JITTER)));
     }
 
-    if let Some(h) = hovered {
-        draw_hover(canvas, tree, layout, depth, h);
-    }
 }
 
 /// Brightness lift applied to the hovered block itself. Each enclosing
@@ -401,7 +427,7 @@ const HOVER_MIN: f32 = 0.012;
 ///
 /// The base canvas is never mutated by anything else, so un-hovering is a plain
 /// redraw rather than an undo.
-fn draw_hover(
+pub fn draw_hover(
     canvas: &mut Canvas,
     tree: &Tree,
     layout: &Layout,
@@ -740,6 +766,51 @@ mod tests {
     }
 
     #[test]
+    fn expanded_directory_tints_are_fully_overdrawn() {
+        // The tint loop skips expanded directories on the grounds that their
+        // children cover them completely. If that ever stops holding, the map
+        // would render with holes, so assert the covering directly.
+        let t = Tree::build(
+            &[
+                (PathBuf::from("src/git/a.rs"), 300),
+                (PathBuf::from("src/git/b.rs"), 150),
+                (PathBuf::from("src/render/c.rs"), 200),
+                (PathBuf::from("docs/x.md"), 100),
+                (PathBuf::from("docs/y.md"), 80),
+                (PathBuf::from("README.md"), 50),
+            ],
+            Scale::Linear,
+        );
+        let l = treemap::layout(&t, Rect::new(0.0, 0.0, 120.0, 80.0));
+        for id in 0..t.len() {
+            if !t.node(id).is_dir || l.collapsed[id] || id == t.root {
+                continue;
+            }
+            let Some(r) = l.rects[id] else { continue };
+            // Every pixel centre of an expanded directory must belong to some
+            // drawn leaf beneath it.
+            let leaves: Vec<crate::layout::treemap::Rect> = t
+                .files_under(id)
+                .into_iter()
+                .filter_map(|f| l.rects[f])
+                .collect();
+            let mut y = r.y + 0.5;
+            while y < r.y + r.h {
+                let mut x = r.x + 0.5;
+                while x < r.x + r.w {
+                    assert!(
+                        leaves.iter().any(|q| q.contains(x, y)),
+                        "{:?} is not covered at ({x},{y})",
+                        t.node(id).path
+                    );
+                    x += 1.0;
+                }
+                y += 1.0;
+            }
+        }
+    }
+
+    #[test]
     fn churn_spreads_the_crowded_low_end() {
         // The point of the view: on a real repository ~90% of files have three
         // commits or fewer, so 1 / 2 / 3 must be clearly different. Normalising
@@ -760,6 +831,7 @@ mod tests {
             "1 and 3 commits are too close to tell apart: {a} vs {d}"
         );
     }
+
     #[test]
     fn churn_outliers_do_not_flatten_everyone_else() {
         // One file with a hundred commits must not compress every ordinary file
@@ -782,6 +854,7 @@ mod tests {
             spread(&lo)
         );
     }
+
     #[test]
     fn churn_one_commit_sits_at_the_bottom_of_the_ramp() {
         // Regression: ln_1p put a single commit a fifth of the way up the ramp,
