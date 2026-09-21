@@ -869,6 +869,12 @@ impl App {
         }
     }
 
+    /// Where the churn ramp saturates for the current walk.
+    fn churn_saturation(&self) -> u32 {
+        let mut counts: Vec<u32> = self.data.churn.values().copied().collect();
+        map::ChurnColorizer::saturation_point(&mut counts)
+    }
+
     /// Move the churn selection, and point the map at the same file.
     ///
     /// Setting `pinned` as well as `hovered` is what keeps the highlight where
@@ -968,7 +974,7 @@ impl App {
                 palette: StatusPalette::default(),
             }),
             View::Churn => Box::new(map::ChurnColorizer {
-                max: self.data.churn.values().copied().max().unwrap_or(0),
+                max: self.churn_saturation(),
             }),
             View::Log => Box::new(map::LogColorizer {
                 palette: StatusPalette::default(),
@@ -1197,7 +1203,9 @@ impl App {
         }
         let top = self.churn_top.min(ranked.len().saturating_sub(1));
 
-        let max = ranked[0].1.max(1);
+        let ramp = map::ChurnColorizer {
+            max: self.churn_saturation(),
+        };
         let hovered = self.target().map(|id| self.tree.node(id).path.clone());
         let width = ranked
             .iter()
@@ -1220,12 +1228,10 @@ impl App {
             } else {
                 Style::default()
             };
-            // Tint the count by the same ramp the map uses, so a line in the
-            // list and its block on the map are recognisably the same value.
-            let c = palette::sample(
-                &palette::CONTRIB_GREEN[1..],
-                (*n as f32).ln_1p() / (max as f32).ln_1p(),
-            );
+            // Tint the count through the colorizer, so a line in the list and
+            // its block on the map are the same colour by construction rather
+            // than by two copies of the ramp maths agreeing.
+            let c = ramp.color_for(*n);
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{n:>width$} "),

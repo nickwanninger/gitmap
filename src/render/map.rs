@@ -182,18 +182,58 @@ impl Colorizer for HeatColorizer {
 /// the ramp is normalised against the busiest file in the walk and log-scaled,
 /// which is what keeps the long tail of two- and three-commit files apart.
 pub struct ChurnColorizer {
-    /// Highest churn count in the current walk, or 0 when there is no history.
+    /// Count at which the ramp saturates: the walk's 99th percentile, not its
+    /// maximum. See `saturation_point`.
     pub max: u32,
 }
 
 impl ChurnColorizer {
-    /// Map a commit count onto 0..1 against the busiest file.
+    /// Where the ramp should top out, given every file's commit count.
+    ///
+    /// Not the maximum. Churn is heavy-tailed — on a real repository ~90% of
+    /// files have three commits or fewer while the busiest has a hundred — so
+    /// normalising against the maximum spends the whole ramp on a handful of
+    /// outliers and leaves almost every file in one flat dark band.
+    ///
+    /// The 99th percentile instead gives that crowded low end most of the ramp
+    /// and lets the top 1% share the brightest step. Losing the distinction
+    /// between the two busiest files costs nothing; losing it between one and
+    /// three commits costs the view its point.
+    pub fn saturation_point(counts: &mut [u32]) -> u32 {
+        if counts.is_empty() {
+            return 0;
+        }
+        counts.sort_unstable();
+        // The 99th percentile, but never the top element itself. On a small
+        // repository 1% rounds up to the maximum, which would make this a no-op
+        // exactly where one hot file dominates hardest.
+        let n = counts.len();
+        let p99 = ((n as f32 * 0.99).ceil() as usize).saturating_sub(1);
+        let i = p99.min(n.saturating_sub(2));
+        counts[i].max(1)
+    }
+
+    /// The ramp colour for a commit count, so the side list can tint its rows
+    /// to match the map rather than restating the ramp maths and drifting.
+    pub fn color_for(&self, count: u32) -> Rgb {
+        if count == 0 {
+            return palette::CONTRIB_GREEN[0];
+        }
+        palette::sample(&palette::CONTRIB_GREEN[1..], Self::t(count, self.max))
+    }
+
+    /// Map a commit count onto 0..1, log-scaled.
+    ///
+    /// `ln(n)` rather than `ln(1 + n)`, so a file with one commit sits at the
+    /// bottom of the ramp. With `ln_1p` it landed a fifth of the way up, which
+    /// wasted the darkest steps and squeezed the 1..3 range — where most files
+    /// live — into a span too narrow to read.
     fn t(count: u32, max: u32) -> f32 {
-        if count == 0 || max <= 1 {
+        if count <= 1 || max <= 1 {
             return 0.0;
         }
-        let c = (count as f32).ln_1p();
-        let m = (max as f32).ln_1p();
+        let c = (count as f32).ln();
+        let m = (max as f32).ln();
         (c / m).clamp(0.0, 1.0)
     }
 }
@@ -201,15 +241,10 @@ impl ChurnColorizer {
 impl Colorizer for ChurnColorizer {
     fn color(&self, tree: &Tree, id: NodeId, data: &MapData) -> Rgb {
         match data.churn.get(&tree.node(id).path) {
-            // The ramp's low end is the "no commits" tile, so a file with one
-            // commit must not land there: lift the floor off the empty step.
-            Some(&n) if n > 0 => {
-                let t = Self::t(n, self.max);
-                palette::sample(&palette::CONTRIB_GREEN[1..], t)
-            }
+            Some(&n) => self.color_for(n),
             // Untracked, or older than the walk. Same cold neutral the age view
             // uses for "the data does not say".
-            _ => palette::CONTRIB_GREEN[0],
+            None => palette::CONTRIB_GREEN[0],
         }
     }
 
@@ -702,6 +737,67 @@ mod tests {
             (q - u).abs() > 0.02,
             "one commit ({q}) must not look like none ({u})"
         );
+    }
+
+    #[test]
+    fn churn_spreads_the_crowded_low_end() {
+        // The point of the view: on a real repository ~90% of files have three
+        // commits or fewer, so 1 / 2 / 3 must be clearly different. Normalising
+        // against the maximum of a heavy tail put them all in one dark band.
+        let mut counts: Vec<u32> = std::iter::repeat_n(1, 60)
+            .chain(std::iter::repeat_n(2, 25))
+            .chain(std::iter::repeat_n(3, 10))
+            .chain([8, 20, 60, 103])
+            .collect();
+        let c = ChurnColorizer {
+            max: ChurnColorizer::saturation_point(&mut counts),
+        };
+        let l = |n: u32| palette::to_oklab(c.color_for(n)).l;
+        let (a, b, d) = (l(1), l(2), l(3));
+        assert!(a < b && b < d, "1/2/3 must be ordered: {a} {b} {d}");
+        assert!(
+            d - a > 0.10,
+            "1 and 3 commits are too close to tell apart: {a} vs {d}"
+        );
+    }
+    #[test]
+    fn churn_outliers_do_not_flatten_everyone_else() {
+        // One file with a hundred commits must not compress every ordinary file
+        // into the ramp's darkest step.
+        let mut with: Vec<u32> = vec![1, 2, 3, 500];
+        let mut without: Vec<u32> = vec![1, 2, 3];
+        let hi = ChurnColorizer {
+            max: ChurnColorizer::saturation_point(&mut with),
+        };
+        let lo = ChurnColorizer {
+            max: ChurnColorizer::saturation_point(&mut without),
+        };
+        let spread = |c: &ChurnColorizer| {
+            palette::to_oklab(c.color_for(3)).l - palette::to_oklab(c.color_for(1)).l
+        };
+        assert!(
+            spread(&hi) > 0.5 * spread(&lo),
+            "an outlier collapsed the 1..3 spread: {} vs {}",
+            spread(&hi),
+            spread(&lo)
+        );
+    }
+    #[test]
+    fn churn_one_commit_sits_at_the_bottom_of_the_ramp() {
+        // Regression: ln_1p put a single commit a fifth of the way up the ramp,
+        // wasting the dark steps and squeezing the range most files occupy.
+        let mut counts = vec![1u32, 2, 4, 8];
+        let c = ChurnColorizer {
+            max: ChurnColorizer::saturation_point(&mut counts),
+        };
+        assert_eq!(
+            c.color_for(1),
+            palette::CONTRIB_GREEN[1],
+            "one commit belongs at the ramp's first lit step"
+        );
+        // And "none" stays off the ramp entirely.
+        assert_eq!(c.color_for(0), palette::CONTRIB_GREEN[0]);
+        assert_ne!(c.color_for(0), c.color_for(1));
     }
 
     #[test]
