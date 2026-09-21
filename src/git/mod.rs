@@ -1,0 +1,164 @@
+//! Git access behind a single trait, so the porcelain and library
+//! implementations stay swappable and testable against a fixture repo.
+
+pub mod parse;
+pub mod porcelain;
+
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+pub use porcelain::PorcelainBackend;
+
+/// How a path differs from HEAD, in the index and in the worktree.
+///
+/// Kept separate rather than collapsed into one state because staging is a
+/// per-side fact: a file can be both staged and modified again on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    None,
+    Added,
+    Modified,
+    Deleted,
+    Untracked,
+    Conflicted,
+}
+
+impl Change {
+    /// Map a single `git status --porcelain=v2` XY code point.
+    pub fn from_code(c: u8) -> Change {
+        match c {
+            b'A' => Change::Added,
+            b'M' | b'T' => Change::Modified,
+            b'D' => Change::Deleted,
+            b'U' => Change::Conflicted,
+            _ => Change::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileStatus {
+    pub path: PathBuf,
+    /// Index vs HEAD — the staged side.
+    pub staged: Change,
+    /// Worktree vs index — the unstaged side.
+    pub unstaged: Change,
+}
+
+impl FileStatus {
+    pub fn is_staged(&self) -> bool {
+        self.staged != Change::None
+    }
+
+    /// The change worth colouring. The unstaged side wins when both are
+    /// present, since that is the edit the user is currently making.
+    pub fn dominant(&self) -> Change {
+        if self.unstaged != Change::None {
+            self.unstaged
+        } else {
+            self.staged
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    /// Lines of code, counted lazily from the worktree. `None` until measured.
+    pub loc: Option<u64>,
+}
+
+/// A parsed unified diff. Hunk boundaries are first-class from the start so
+/// hunk-level staging can be added later without reworking the pane.
+#[derive(Debug, Clone, Default)]
+pub struct Diff {
+    pub hunks: Vec<Hunk>,
+    /// True when git reported the file as binary rather than emitting text.
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Hunk {
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffLine {
+    pub kind: LineKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    Context,
+    Added,
+    Removed,
+    /// `\ No newline at end of file`
+    Meta,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitMeta {
+    pub oid: String,
+    pub time: i64,
+    pub author: String,
+    pub subject: String,
+}
+
+/// What the repository is in the middle of, if anything. Surfaced in the status
+/// bar, because otherwise the tool lies about what committing will do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoState {
+    Clean,
+    Merging,
+    Rebasing,
+    CherryPicking,
+    Reverting,
+    Bisecting,
+}
+
+impl RepoState {
+    pub fn label(&self) -> Option<&'static str> {
+        match self {
+            RepoState::Clean => None,
+            RepoState::Merging => Some("MERGING"),
+            RepoState::Rebasing => Some("REBASING"),
+            RepoState::CherryPicking => Some("CHERRY-PICKING"),
+            RepoState::Reverting => Some("REVERTING"),
+            RepoState::Bisecting => Some("BISECTING"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeadInfo {
+    /// Branch name, or `None` when detached.
+    pub branch: Option<String>,
+    pub oid: Option<String>,
+    pub state: RepoState,
+}
+
+impl HeadInfo {
+    pub fn label(&self) -> String {
+        match (&self.branch, &self.oid) {
+            (Some(b), _) => b.clone(),
+            (None, Some(oid)) => format!("detached @ {}", &oid[..oid.len().min(8)]),
+            (None, None) => "no commits".to_string(),
+        }
+    }
+}
+
+pub trait GitBackend: Send + Sync {
+    fn status(&self) -> Result<Vec<FileStatus>>;
+    fn tree_at_head(&self) -> Result<Vec<TreeEntry>>;
+    fn diff(&self, path: &Path, staged: bool) -> Result<Diff>;
+    fn head(&self) -> Result<HeadInfo>;
+    #[allow(dead_code)]
+    fn log(&self, limit: usize) -> Result<Vec<CommitMeta>>;
+
+    fn stage(&self, path: &Path) -> Result<()>;
+    fn unstage(&self, path: &Path) -> Result<()>;
+    fn commit(&self, msg: &str, amend: bool) -> Result<String>;
+}
