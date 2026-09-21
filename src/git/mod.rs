@@ -150,6 +150,18 @@ impl HeadInfo {
     }
 }
 
+/// One instalment of a streaming history walk.
+pub struct HistoryChunk {
+    /// Per path: last touch time, and commits touching it so far. Cumulative —
+    /// each chunk supersedes the last rather than adding to it.
+    pub entries: Vec<(PathBuf, i64, u32)>,
+    /// Commits walked so far, for the progress line.
+    pub commits: usize,
+    /// Whether this is the final chunk. Until it is, counts are "commits in
+    /// the most recent N", because git walks newest first.
+    pub done: bool,
+}
+
 pub trait GitBackend: Send + Sync {
     fn status(&self) -> Result<Vec<FileStatus>>;
     fn tree_at_head(&self) -> Result<Vec<TreeEntry>>;
@@ -163,6 +175,29 @@ pub trait GitBackend: Send + Sync {
     /// One history walk: per path, when it was last touched and by how many
     /// commits. Feeds the heatmap.
     fn history(&self, limit: usize) -> Result<Vec<(PathBuf, i64, u32)>>;
+
+    /// The same walk, unbounded, delivered in chunks as git produces them.
+    ///
+    /// `on_chunk` is called with everything parsed so far plus the number of
+    /// commits seen, and returns false to abort the walk. Streaming is what
+    /// lets the walk be unbounded: a full walk of a 27k-commit repository takes
+    /// over two seconds, but the first counts land in about 25ms, so the map
+    /// can start painting immediately and refine as the rest arrives.
+    ///
+    /// The default implementation falls back to one bounded `history` call, so
+    /// a backend that cannot stream still works.
+    fn history_stream(
+        &self,
+        on_chunk: &mut dyn FnMut(HistoryChunk) -> bool,
+    ) -> Result<()> {
+        let entries = self.history(2000)?;
+        on_chunk(HistoryChunk {
+            entries,
+            commits: 0,
+            done: true,
+        });
+        Ok(())
+    }
 
     fn stage(&self, path: &Path) -> Result<()>;
     fn unstage(&self, path: &Path) -> Result<()>;

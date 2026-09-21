@@ -220,6 +220,72 @@ impl GitBackend for PorcelainBackend {
         Ok(parse::history_walk(&out))
     }
 
+    fn history_stream(
+        &self,
+        on_chunk: &mut dyn FnMut(super::HistoryChunk) -> bool,
+    ) -> Result<()> {
+        use std::io::Read;
+        // Unbounded: the point of streaming is that the walk no longer needs a
+        // commit cap to stay responsive.
+        let mut child = Command::new("git")
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args([
+                "log",
+                "--format=%H%x00%at",
+                "--name-only",
+                "-z",
+                "--no-renames",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("git log")?;
+
+        let mut out = child.stdout.take().expect("piped");
+        let mut accum = parse::HistoryAccum::new();
+        let mut buf = [0u8; 256 * 1024];
+        // Emit on a timer rather than per read, so a fast walk does not flood
+        // the channel with a repaint per 256KB.
+        const EMIT_EVERY: std::time::Duration = std::time::Duration::from_millis(120);
+        let mut last = std::time::Instant::now();
+        let mut aborted = false;
+
+        loop {
+            let n = out.read(&mut buf).context("reading git log")?;
+            if n == 0 {
+                break;
+            }
+            accum.push(&buf[..n]);
+            if last.elapsed() >= EMIT_EVERY {
+                last = std::time::Instant::now();
+                let keep = on_chunk(super::HistoryChunk {
+                    entries: accum.entries(),
+                    commits: accum.commits,
+                    done: false,
+                });
+                if !keep {
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+
+        // Dropping stdout lets git see EPIPE and exit rather than blocking on a
+        // pipe nobody is draining.
+        drop(out);
+        let _ = child.wait();
+
+        if !aborted {
+            on_chunk(super::HistoryChunk {
+                entries: accum.entries(),
+                commits: accum.commits,
+                done: true,
+            });
+        }
+        Ok(())
+    }
+
     fn stage(&self, path: &Path) -> Result<()> {
         // `-A` so a deletion stages as a deletion rather than being ignored.
         self.write_cmd(&["add", "-A", "--", &arg(path)])?;

@@ -58,12 +58,14 @@ const DIFF_MAX_COLS: u16 = 82;
 /// going deeper cheap, and that is M2 work.
 const LOG_LIMIT: usize = 200;
 
-/// How many commits the heatmap's history walk covers.
+/// How often the gathering spinner advances a frame.
+const SPINNER_TICK: Duration = Duration::from_millis(100);
+
+/// Frames of the gathering spinner, one per redraw tick.
 ///
-/// Deeper than the log because age wants the whole recent past, but still
-/// bounded: the design doc's on-disk incremental cache is what makes a full
-/// walk of a large repository affordable, and that is still to come.
-const HISTORY_LIMIT: usize = 2000;
+/// Braille rather than ASCII so it occupies one cell and reads as motion at the
+/// size the pane gives it.
+const SPINNER: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 /// Split direction. Diffs want width, maps want square.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +169,15 @@ pub struct App {
     detail_seq: u64,
     /// Set once the heatmap's history walk has been requested.
     history_loaded: bool,
+    /// Commits the streaming walk has covered so far, for the progress line.
+    history_walked: usize,
+    /// Whether that walk has finished. Until it has, churn counts are "commits
+    /// in the most recent N", because git walks newest first.
+    history_done: bool,
+    /// Spinner frame, advanced on a timer so it turns at a constant rate
+    /// rather than at whatever rate the UI happens to repaint.
+    spinner: usize,
+    spinner_at: Instant,
     /// Index into the churn ranking of the selected file, for j/k.
     churn_sel: usize,
     /// First visible row of the churn list, so the selection can scroll
@@ -224,6 +235,10 @@ impl App {
             commit_diff: None,
             detail_seq: 0,
             history_loaded: false,
+            history_walked: 0,
+            history_done: false,
+            spinner: 0,
+            spinner_at: Instant::now(),
             churn_sel: 0,
             churn_top: 0,
             pending: None,
@@ -258,9 +273,21 @@ impl App {
         // still fires on an otherwise idle terminal.
         let timeout = if self.pending_hover.is_some() {
             DIFF_DEBOUNCE
+        } else if self.gathering() {
+            // Tick fast enough for the spinner to read as motion while the
+            // history walk streams in.
+            SPINNER_TICK
         } else {
             Duration::from_millis(250)
         };
+
+        // Advance the spinner on a wall clock, so its rate does not depend on
+        // how often anything else forces a redraw.
+        if self.gathering() && self.spinner_at.elapsed() >= SPINNER_TICK {
+            self.spinner_at = Instant::now();
+            self.spinner = self.spinner.wrapping_add(1);
+            self.dirty = true;
+        }
 
         crossbeam_select(events, msgs, timeout, |ev| match ev {
             Either::Event(e) => {
@@ -373,7 +400,11 @@ impl App {
                 // The file under the cursor just changed sides.
                 self.request_diff();
             }
-            Message::History(entries) => {
+            Message::History {
+                entries,
+                commits,
+                done,
+            } => {
                 // Ages are relative to now, so they are computed once here
                 // rather than on every redraw.
                 let now = std::time::SystemTime::now()
@@ -385,8 +416,16 @@ impl App {
                     .map(|(p, t, _)| (p.clone(), (now - t).max(0)))
                     .collect();
                 self.data.churn = entries.into_iter().map(|(p, _, n)| (p, n)).collect();
-                self.history_loaded = true;
-                self.pending = None;
+                self.history_walked = commits;
+                self.history_done = done;
+                if done {
+                    self.pending = None;
+                }
+                // Keep the churn selection on the same file as the ranking
+                // reshuffles underneath it.
+                if self.view == View::Churn && done {
+                    self.sync_churn_sel();
+                }
             }
             Message::Log(commits) => {
                 self.pending = None;
@@ -690,9 +729,8 @@ impl App {
             // Lazily loaded, like the log: a session that never opens the
             // heatmap should not pay for the walk.
             self.history_loaded = true;
-            let _ = self.tx.send(Request::History {
-                limit: HISTORY_LIMIT,
-            });
+            self.pending = Some("gathering history…");
+            let _ = self.tx.send(Request::History);
         }
         // Entering churn, start the selection from whatever the map is already
         // pointing at, so switching tabs does not throw away the file the user
@@ -867,6 +905,30 @@ impl App {
         if let Some(i) = self.churn_ranking().iter().position(|(p, _)| *p == path) {
             self.churn_sel = i;
         }
+    }
+
+    /// Why a file has no history, in the cases we can actually distinguish.
+    ///
+    /// "No commits touch this file" is only true for something never committed.
+    /// An untracked file is exactly that; anything else tracked but absent from
+    /// a completed walk was renamed, since the walk passes `--no-renames` and
+    /// so stops at a rename rather than following through it.
+    fn no_history_reason(&self, path: &std::path::Path) -> String {
+        let untracked = self
+            .status
+            .get(path)
+            .map(|s| s.unstaged == Change::Untracked)
+            .unwrap_or(false);
+        if untracked {
+            "untracked · not in any commit".to_string()
+        } else {
+            "no commits touch this file".to_string()
+        }
+    }
+
+    /// Whether a history walk is in flight, so the UI should animate.
+    fn gathering(&self) -> bool {
+        self.history_loaded && !self.history_done
     }
 
     /// Where the churn ramp saturates for the current walk.
@@ -1134,12 +1196,21 @@ impl App {
                         let churn = self.data.churn.get(&path).copied().unwrap_or(0);
                         lines.push(Line::from(format!("commits       {churn}")));
                     }
-                    None if self.data.age.is_empty() => lines.push(Line::from(Span::styled(
-                        "walking history…",
-                        Style::default().fg(Color::DarkGray),
-                    ))),
+                    // While the walk is still running, absence means "not
+                    // reached yet", not "never committed". Saying the latter
+                    // would be wrong for most files for most of the walk.
+                    None if self.gathering() => lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{} ", SPINNER[self.spinner % SPINNER.len()]),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            "gathering history…",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ])),
                     None => lines.push(Line::from(Span::styled(
-                        "no commits touch this file",
+                        self.no_history_reason(&path),
                         Style::default().fg(Color::DarkGray),
                     ))),
                 }
@@ -1157,10 +1228,47 @@ impl App {
     /// the busiest files are often small, so they are easy to miss as blocks.
     fn draw_churn_pane(&mut self, f: &mut Frame, area: Rect) {
         let ranked = self.churn_ranking();
+
+        // The ranking is withheld until the walk finishes. git walks newest
+        // first, so a partial count is "commits in the most recent N" — a real
+        // quantity, but not the one this list claims, and the order visibly
+        // reshuffles while it fills. The map updates live regardless: a block
+        // growing greener reads as progress, whereas a top-ten list rewriting
+        // itself reads as a glitch.
+        if !self.history_done {
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    format!("{} ", SPINNER[self.spinner % SPINNER.len()]),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    if self.history_walked == 0 {
+                        "gathering history…".to_string()
+                    } else {
+                        format!("gathering history… {} commits", self.history_walked)
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])];
+            lines.push(Line::from(Span::styled(
+                "  ranking appears when complete",
+                Style::default().fg(Color::DarkGray),
+            )));
+            if !ranked.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {} files so far · map is live", ranked.len()),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            f.render_widget(Paragraph::new(lines), area);
+            return;
+        }
+
         if ranked.is_empty() {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "walking history…",
+                    "no history here",
                     Style::default().fg(Color::DarkGray),
                 ))),
                 area,
@@ -1177,7 +1285,7 @@ impl App {
             )));
             let n = self.data.churn.get(&path).copied().unwrap_or(0);
             head.push(Line::from(match n {
-                0 => "no commits touch this file".to_string(),
+                0 => self.no_history_reason(&path),
                 1 => "1 commit".to_string(),
                 n => format!("{n} commits"),
             }));
@@ -2055,10 +2163,14 @@ mod tests {
     #[test]
     fn history_fills_age_and_churn() {
         let (mut a, _rx) = app();
-        a.on_message(Message::History(vec![
-            (PathBuf::from("a.rs"), 1_700_000_000, 4),
-            (PathBuf::from("b.rs"), 1_600_000_000, 1),
-        ]));
+        a.on_message(Message::History {
+            entries: vec![
+                (PathBuf::from("a.rs"), 1_700_000_000, 4),
+                (PathBuf::from("b.rs"), 1_600_000_000, 1),
+            ],
+            commits: 5,
+            done: true,
+        });
         assert_eq!(a.data.age.len(), 2);
         assert_eq!(a.data.churn[Path::new("a.rs")], 4);
         // Ages are seconds-since, so the older file has the larger value.
@@ -2086,11 +2198,15 @@ mod tests {
                 loc: None,
             },
         ]));
-        a.on_message(Message::History(vec![
-            (PathBuf::from("busy.rs"), 1_700_000_000, 9),
-            (PathBuf::from("mid.rs"), 1_700_000_000, 5),
-            (PathBuf::from("quiet.rs"), 1_700_000_000, 1),
-        ]));
+        a.on_message(Message::History {
+            entries: vec![
+                (PathBuf::from("busy.rs"), 1_700_000_000, 9),
+                (PathBuf::from("mid.rs"), 1_700_000_000, 5),
+                (PathBuf::from("quiet.rs"), 1_700_000_000, 1),
+            ],
+            commits: 9,
+            done: true,
+        });
         a.view = View::Churn;
         (a, rx)
     }

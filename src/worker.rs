@@ -30,10 +30,9 @@ pub enum Request {
     Log {
         limit: usize,
     },
-    /// The history walk behind the heatmap.
-    History {
-        limit: usize,
-    },
+    /// The history walk behind the heatmap and churn views. Unbounded and
+    /// streamed; results arrive as a series of `History` messages.
+    History,
     /// Which files a commit touched, plus its diff for the pane. Tagged with a
     /// sequence number so a result for a selection the user has already moved
     /// past is dropped, exactly as hover diffs are.
@@ -56,7 +55,13 @@ pub enum Message {
         seq: u64,
     },
     Log(Vec<CommitMeta>),
-    History(Vec<(std::path::PathBuf, i64, u32)>),
+    /// One instalment of the streaming history walk. Cumulative: each message
+    /// supersedes the last rather than adding to it.
+    History {
+        entries: Vec<(std::path::PathBuf, i64, u32)>,
+        commits: usize,
+        done: bool,
+    },
     CommitDetail {
         oid: String,
         paths: Vec<std::path::PathBuf>,
@@ -121,8 +126,20 @@ fn handle(backend: &dyn GitBackend, req: Request, tx: &Sender<Message>) -> anyho
         Request::Log { limit } => {
             let _ = tx.send(Message::Log(backend.log(limit)?));
         }
-        Request::History { limit } => {
-            let _ = tx.send(Message::History(backend.history(limit)?));
+        Request::History => {
+            // Send each chunk onward; stop the walk if the app has gone away,
+            // so quitting mid-walk does not leave git running.
+            let mut alive = true;
+            backend.history_stream(&mut |c| {
+                alive = tx
+                    .send(Message::History {
+                        entries: c.entries,
+                        commits: c.commits,
+                        done: c.done,
+                    })
+                    .is_ok();
+                alive
+            })?;
         }
         Request::CommitDetail { oid, seq } => {
             let paths = backend.paths_in_commit(&oid)?;

@@ -284,6 +284,108 @@ fn strip_leading_newline(f: &[u8]) -> &[u8] {
     }
 }
 
+/// Incremental version of `history_walk`, for a streaming walk.
+///
+/// Holds the accumulator and the partial trailing field between chunks, so a
+/// path split across a read boundary is not counted as two truncated paths.
+#[derive(Default)]
+pub struct HistoryAccum {
+    acc: std::collections::HashMap<PathBuf, (i64, u32)>,
+    /// Bytes after the last NUL, which may be half a field.
+    partial: Vec<u8>,
+    time: i64,
+    /// Commits seen, for the progress line.
+    pub commits: usize,
+}
+
+impl HistoryAccum {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the next chunk of git's output.
+    ///
+    /// Only whole fields are consumed. An oid additionally needs the time field
+    /// that follows it, so when a chunk ends between the two, both are held
+    /// back: consuming the oid alone would drop the commit's timestamp and then
+    /// count the time field as a filename on the next push.
+    pub fn push(&mut self, data: &[u8]) {
+        self.partial.extend_from_slice(data);
+        let Some(last_nul) = self.partial.iter().rposition(|&b| b == 0) else {
+            return;
+        };
+
+        // Consume complete fields, but stop at a trailing oid whose time has
+        // not arrived; `taken` is how far into the buffer we got.
+        let mut taken = 0usize;
+        let mut start = 0usize;
+        let mut pending_oid = false;
+        let end = last_nul + 1;
+        while start < end {
+            let Some(rel) = self.partial[start..end].iter().position(|&b| b == 0) else {
+                break;
+            };
+            let f = &self.partial[start..start + rel];
+            let next = start + rel + 1;
+
+            if f.is_empty() {
+                start = next;
+                taken = next;
+                continue;
+            }
+
+            if pending_oid {
+                // This field is the time, possibly with the first path glued on.
+                let (t, first) = match f.iter().position(|&b| b == b'\n') {
+                    Some(i) => (&f[..i], Some(&f[i + 1..])),
+                    None => (f, None),
+                };
+                self.time = std::str::from_utf8(t)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(self.time);
+                if let Some(p) = first
+                    && !p.is_empty()
+                {
+                    let p = p.to_vec();
+                    touch(&mut self.acc, &p, self.time);
+                }
+                pending_oid = false;
+                start = next;
+                taken = next;
+                continue;
+            }
+
+            if looks_like_oid(f) {
+                // Hold the oid until its time field is also here.
+                self.commits += 1;
+                pending_oid = true;
+                start = next;
+                continue;
+            }
+
+            let p = strip_leading_newline(f).to_vec();
+            touch(&mut self.acc, &p, self.time);
+            start = next;
+            taken = next;
+        }
+
+        if pending_oid {
+            // Un-count it; the next push will see the whole pair.
+            self.commits -= 1;
+        }
+        self.partial.drain(..taken);
+    }
+
+    /// Snapshot of the counts so far.
+    pub fn entries(&self) -> Vec<(PathBuf, i64, u32)> {
+        self.acc
+            .iter()
+            .map(|(p, &(t, n))| (p.clone(), t, n))
+            .collect()
+    }
+}
+
 /// Record that `path` was touched at `time`, keeping the newest timestamp.
 fn touch(acc: &mut std::collections::HashMap<PathBuf, (i64, u32)>, path: &[u8], time: i64) {
     let e = acc.entry(path_from_bytes(path)).or_insert((time, 0));
@@ -450,6 +552,44 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x001000\x00\nsrc/a.rs\x00";
             !w.iter().any(|e| e.0.to_string_lossy().starts_with('\n')),
             "no path may keep its leading newline: {w:?}"
         );
+    }
+
+    #[test]
+    fn history_accum_matches_the_one_shot_walk_at_every_split() {
+        // The streaming walk reads fixed-size blocks, so a NUL-separated field
+        // is routinely cut in half. Feeding the same bytes one split at a time
+        // must land on the same counts as parsing them whole.
+        let data: &[u8] = b"\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x002000\x00\nsrc/a.rs\x00src/b.rs\x00\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x001000\x00\nsrc/a.rs\x00docs/c.md\x00";
+        let mut want = history_walk(data);
+        want.sort();
+
+        for split in 0..data.len() {
+            let mut acc = HistoryAccum::new();
+            acc.push(&data[..split]);
+            acc.push(&data[split..]);
+            let mut got = acc.entries();
+            got.sort();
+            assert_eq!(got, want, "split at {split} changed the result");
+            assert_eq!(acc.commits, 2, "split at {split} lost a commit");
+        }
+    }
+
+    #[test]
+    fn history_accum_handles_byte_at_a_time_delivery() {
+        // The pathological case: every field split across many pushes.
+        let data: &[u8] = b"\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x002000\x00\nsrc/a.rs\x00src/b.rs\x00";
+        let mut acc = HistoryAccum::new();
+        for b in data {
+            acc.push(std::slice::from_ref(b));
+        }
+        let mut got = acc.entries();
+        got.sort();
+        let mut want = history_walk(data);
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
