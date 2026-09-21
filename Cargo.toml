@@ -3,6 +3,14 @@ name = "gitmap"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "gitmap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gitmap"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 crossterm = "0.29.0"

@@ -1,11 +1,6 @@
 //! gitmap — a WinDirStat-style TUI git interface.
 
-mod app;
-mod git;
-mod input;
-mod layout;
-mod render;
-mod worker;
+use gitmap::{app, git, layout, worker};
 
 use anyhow::Result;
 use app::{App, Split};
@@ -83,7 +78,19 @@ OPTIONS:
 
 Press ? inside the program for keybindings.";
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match real_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // The terminal is already restored by this point, so a plain
+            // stderr write is safe and lands where a shell expects it.
+            eprintln!("gitmap: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn real_main() -> Result<()> {
     let Some(opts) = parse_args()? else {
         return Ok(());
     };

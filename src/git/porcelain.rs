@@ -146,24 +146,24 @@ impl GitBackend for PorcelainBackend {
         // contents as one synthetic all-added hunk so hovering it is useful.
         if diff.hunks.is_empty() && !diff.binary && !staged {
             let abs = self.root.join(path);
-            if let Ok(content) = std::fs::read(&abs) {
-                if let Ok(text) = String::from_utf8(content) {
-                    let lines: Vec<_> = text
-                        .lines()
-                        .map(|l| super::DiffLine {
-                            kind: super::LineKind::Added,
-                            text: l.to_string(),
-                        })
-                        .collect();
-                    if !lines.is_empty() {
-                        return Ok(Diff {
-                            hunks: vec![super::Hunk {
-                                header: format!("@@ +1,{} @@ (untracked)", lines.len()),
-                                lines,
-                            }],
-                            binary: false,
-                        });
-                    }
+            if let Ok(content) = std::fs::read(&abs)
+                && let Ok(text) = String::from_utf8(content)
+            {
+                let lines: Vec<_> = text
+                    .lines()
+                    .map(|l| super::DiffLine {
+                        kind: super::LineKind::Added,
+                        text: l.to_string(),
+                    })
+                    .collect();
+                if !lines.is_empty() {
+                    return Ok(Diff {
+                        hunks: vec![super::Hunk {
+                            header: format!("@@ +1,{} @@ (untracked)", lines.len()),
+                            lines,
+                        }],
+                        binary: false,
+                    });
                 }
             }
         }
@@ -182,13 +182,7 @@ impl GitBackend for PorcelainBackend {
 
     fn log(&self, limit: usize) -> Result<Vec<CommitMeta>> {
         let n = limit.to_string();
-        let out = self.read(&[
-            "log",
-            "--format=%H%x00%at%x00%an%x00%s",
-            "-z",
-            "-n",
-            &n,
-        ])?;
+        let out = self.read(&["log", "--format=%H%x00%at%x00%an%x00%s", "-z", "-n", &n])?;
         Ok(parse::log(&out))
     }
 
@@ -239,7 +233,14 @@ impl GitBackend for PorcelainBackend {
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
-            bail!("{}", if msg.is_empty() { "commit failed".into() } else { msg });
+            bail!(
+                "{}",
+                if msg.is_empty() {
+                    "commit failed".into()
+                } else {
+                    msg
+                }
+            );
         }
         let oid = self.read(&["rev-parse", "HEAD"])?;
         Ok(String::from_utf8_lossy(&oid).trim().to_string())

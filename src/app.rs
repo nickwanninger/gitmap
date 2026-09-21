@@ -158,11 +158,11 @@ impl App {
         crossbeam_select(events, msgs, timeout, |ev| match ev {
             Either::Event(e) => {
                 got_anything = true;
-                if let Event::Mouse(m) = &e {
-                    if matches!(m.kind, MouseEventKind::Moved) {
-                        latest_motion = Some(*m);
-                        return;
-                    }
+                if let Event::Mouse(m) = &e
+                    && matches!(m.kind, MouseEventKind::Moved)
+                {
+                    latest_motion = Some(*m);
+                    return;
                 }
                 self.on_event(e);
             }
@@ -178,11 +178,11 @@ impl App {
             while let Ok(e) = events.try_recv() {
                 progressed = true;
                 got_anything = true;
-                if let Event::Mouse(m) = &e {
-                    if matches!(m.kind, MouseEventKind::Moved) {
-                        latest_motion = Some(*m);
-                        continue;
-                    }
+                if let Event::Mouse(m) = &e
+                    && matches!(m.kind, MouseEventKind::Moved)
+                {
+                    latest_motion = Some(*m);
+                    continue;
                 }
                 self.on_event(e);
             }
@@ -204,13 +204,19 @@ impl App {
         let _ = got_anything;
 
         // Fire the debounced diff once the cursor has been still long enough.
-        if let Some(t) = self.pending_hover {
-            if t.elapsed() >= DIFF_DEBOUNCE {
-                self.pending_hover = None;
-                self.request_diff();
-            }
+        if let Some(t) = self.pending_hover
+            && t.elapsed() >= DIFF_DEBOUNCE
+        {
+            self.pending_hover = None;
+            self.request_diff();
         }
         Ok(())
+    }
+
+    /// Apply a worker message. Public so integration tests can drive the app
+    /// deterministically instead of racing the pump loop.
+    pub fn apply(&mut self, m: Message) {
+        self.on_message(m)
     }
 
     fn on_message(&mut self, m: Message) {
@@ -322,7 +328,10 @@ impl App {
                             self.modal = Modal::Error("empty commit message".into());
                         } else {
                             self.modal = Modal::None;
-                            let _ = self.tx.send(Request::Commit { message: msg, amend });
+                            let _ = self.tx.send(Request::Commit {
+                                message: msg,
+                                amend,
+                            });
                         }
                     }
                     KeyCode::Backspace => {
@@ -385,8 +394,12 @@ impl App {
             // in terminals where motion reporting does not survive.
             KeyCode::Char('n') => self.step_changed(1),
             KeyCode::Char('p') => self.step_changed(-1),
-            KeyCode::Char('j') | KeyCode::Down => self.diff_scroll = self.diff_scroll.saturating_add(1),
-            KeyCode::Char('k') | KeyCode::Up => self.diff_scroll = self.diff_scroll.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.diff_scroll = self.diff_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.diff_scroll = self.diff_scroll.saturating_sub(1)
+            }
             KeyCode::Char('y') => self.yank_path(),
             KeyCode::Enter => self.pinned = self.hovered,
             KeyCode::Esc => {
@@ -405,9 +418,7 @@ impl App {
                 self.pinned = self.hovered;
                 self.request_diff();
             }
-            MouseEventKind::ScrollDown => {
-                self.diff_scroll = self.diff_scroll.saturating_add(3)
-            }
+            MouseEventKind::ScrollDown => self.diff_scroll = self.diff_scroll.saturating_add(3),
             MouseEventKind::ScrollUp => self.diff_scroll = self.diff_scroll.saturating_sub(3),
             _ => {}
         }
@@ -415,10 +426,7 @@ impl App {
 
     fn on_motion(&mut self, m: MouseEvent) {
         let area = self.map_area;
-        if m.column < area.x
-            || m.row < area.y
-            || m.column >= area.right()
-            || m.row >= area.bottom()
+        if m.column < area.x || m.row < area.y || m.column >= area.right() || m.row >= area.bottom()
         {
             return;
         }
@@ -467,7 +475,11 @@ impl App {
             return;
         }
         let path = self.tree.node(id).path.clone();
-        let staged = self.status.get(&path).map(|s| s.is_staged()).unwrap_or(false);
+        let staged = self
+            .status
+            .get(&path)
+            .map(|s| s.is_staged())
+            .unwrap_or(false);
         self.undo.push((path.clone(), staged));
         let req = if staged {
             Request::Unstage(path)
@@ -539,7 +551,9 @@ impl App {
         }
         changed.sort_by(|&a, &b| self.tree.node(a).path.cmp(&self.tree.node(b).path));
 
-        let cur = self.target().and_then(|t| changed.iter().position(|&c| c == t));
+        let cur = self
+            .target()
+            .and_then(|t| changed.iter().position(|&c| c == t));
         let next = match cur {
             Some(i) => {
                 let n = changed.len() as i32;
@@ -557,14 +571,18 @@ impl App {
             return;
         }
         let q = query.to_lowercase();
-        let found = self.tree.files_under(self.tree.root).into_iter().find(|&f| {
-            self.tree
-                .node(f)
-                .path
-                .to_string_lossy()
-                .to_lowercase()
-                .contains(&q)
-        });
+        let found = self
+            .tree
+            .files_under(self.tree.root)
+            .into_iter()
+            .find(|&f| {
+                self.tree
+                    .node(f)
+                    .path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&q)
+            });
         match found {
             Some(f) => {
                 self.hovered = Some(f);
@@ -733,9 +751,9 @@ impl App {
             ));
         }
 
-        spans.push(Span::raw(format!(
-            "  ✓{staged} ~{unstaged} +{untracked}  ",
-        )));
+        spans.push(Span::raw(
+            format!("  ✓{staged} ~{unstaged} +{untracked}  ",),
+        ));
 
         if !self.message.is_empty() {
             spans.push(Span::styled(
@@ -893,10 +911,8 @@ mod tests {
     }
 
     fn with_files(a: &mut App, files: &[(&str, u64)]) {
-        let pairs: Vec<(PathBuf, u64)> = files
-            .iter()
-            .map(|(p, s)| (PathBuf::from(*p), *s))
-            .collect();
+        let pairs: Vec<(PathBuf, u64)> =
+            files.iter().map(|(p, s)| (PathBuf::from(*p), *s)).collect();
         a.tree = Tree::build(&pairs, Scale::Linear);
     }
 

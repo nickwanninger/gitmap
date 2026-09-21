@@ -65,11 +65,7 @@ pub fn spawn(
 }
 
 /// Returns `Ok(false)` to stop the worker.
-fn handle(
-    backend: &dyn GitBackend,
-    req: Request,
-    tx: &Sender<Message>,
-) -> anyhow::Result<bool> {
+fn handle(backend: &dyn GitBackend, req: Request, tx: &Sender<Message>) -> anyhow::Result<bool> {
     match req {
         Request::Quit => return Ok(false),
         Request::Status => {

@@ -116,10 +116,10 @@ pub fn head_from_status(data: &[u8]) -> (Option<String>, Option<String>) {
             if v != "(detached)" {
                 branch = Some(v.to_string());
             }
-        } else if let Some(v) = s.strip_prefix("# branch.oid ") {
-            if v != "(initial)" {
-                oid = Some(v.to_string());
-            }
+        } else if let Some(v) = s.strip_prefix("# branch.oid ")
+            && v != "(initial)"
+        {
+            oid = Some(v.to_string());
         }
     }
     (branch, oid)
@@ -269,8 +269,7 @@ mod tests {
 
     #[test]
     fn status_unmerged() {
-        let data =
-            b"u UU N... 100644 100644 100644 100644 a1 a2 a3 conflict.rs\0";
+        let data = b"u UU N... 100644 100644 100644 100644 a1 a2 a3 conflict.rs\0";
         let st = status_v2(data);
         assert_eq!(st.len(), 1);
         assert_eq!(st[0].path, PathBuf::from("conflict.rs"));
@@ -333,9 +332,8 @@ mod tests {
 
     #[test]
     fn diff_binary() {
-        let d = unified_diff(
-            "diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n",
-        );
+        let d =
+            unified_diff("diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n");
         assert!(d.binary);
         assert!(d.hunks.is_empty());
     }

@@ -115,10 +115,11 @@ fn place_children(tree: &Tree, id: NodeId, area: Rect, out: &mut Layout) {
     squarify(tree, &kids, total, inner, out);
 
     for &k in &kids {
-        if let Some(r) = out.rects[k] {
-            if tree.node(k).is_dir && !out.collapsed[k] {
-                place_children(tree, k, r, out);
-            }
+        if let Some(r) = out.rects[k]
+            && tree.node(k).is_dir
+            && !out.collapsed[k]
+        {
+            place_children(tree, k, r, out);
         }
     }
 }
@@ -177,7 +178,15 @@ fn squarify(tree: &Tree, kids: &[NodeId], total: f64, area: Rect, out: &mut Layo
         }
 
         let row = &kids[i..end];
-        remaining = place_row(tree, row, row_weight, remaining, px_per_weight, horizontal, out);
+        remaining = place_row(
+            tree,
+            row,
+            row_weight,
+            remaining,
+            px_per_weight,
+            horizontal,
+            out,
+        );
         remaining_weight -= row_weight;
         i = end;
     }
@@ -269,10 +278,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tree_of(specs: &[(&str, u64)]) -> Tree {
-        let e: Vec<(PathBuf, u64)> = specs
-            .iter()
-            .map(|(p, s)| (PathBuf::from(*p), *s))
-            .collect();
+        let e: Vec<(PathBuf, u64)> = specs.iter().map(|(p, s)| (PathBuf::from(*p), *s)).collect();
         Tree::build(&e, Scale::Linear)
     }
 
@@ -469,4 +475,3 @@ mod tests {
         assert!(l.rects.iter().all(|r| r.is_none()));
     }
 }
-

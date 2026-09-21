@@ -86,7 +86,7 @@ impl HitBuffer {
 mod tests {
     use super::*;
     use crate::layout::tree::{Scale, Tree};
-    use crate::layout::{treemap};
+    use crate::layout::treemap;
     use std::path::PathBuf;
 
     #[test]
@@ -106,7 +106,12 @@ mod tests {
             let r = l.rects[f].unwrap();
             let cx = (r.x + r.w / 2.0) as u16;
             let cy = ((r.y + r.h / 2.0) / 2.0) as u16;
-            assert_eq!(hb.at(cx, cy), Some(f), "{:?} at ({cx},{cy})", t.node(f).path);
+            assert_eq!(
+                hb.at(cx, cy),
+                Some(f),
+                "{:?} at ({cx},{cy})",
+                t.node(f).path
+            );
         }
     }
 
